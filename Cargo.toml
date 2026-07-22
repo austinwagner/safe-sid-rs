@@ -1,0 +1,21 @@
+[package]
+name = "safe-sid"
+version = "0.1.0"
+edition = "2024"
+description = "Safe borrowed/owned wrappers over a Windows security identifier (SID)."
+license = "ISC"
+keywords = ["windows", "security", "SID"]
+categories = ["api-bindings", "os::windows-apis"]
+repository = "https://github.com/austinwagner/safe-sid-rs"
+
+[features]
+default = ["windows-full"]
+windows-full = ["dep:windows"]
+
+[dependencies]
+windows-core = "0.62"
+windows = { version = "0.62", optional = true, features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+] }
