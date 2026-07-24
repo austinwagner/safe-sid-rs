@@ -1,6 +1,93 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
-//! Safe, borrowed/owned wrappers over a Windows security identifier (SID).
+//! Safe borrowed and owned wrappers for Windows security identifiers (SIDs).
+//!
+//! A SID identifies a user, group, logon session, or other security principal.
+//! This crate represents one with the same in-memory layout used by Windows:
+//!
+//! - [`Sid`] is a dynamically sized, borrowed SID, analogous to `str`.
+//! - [`SidBuf`] owns a SID, analogous to [`String`].
+//!
+//! `SidBuf` dereferences to `Sid`, and both types implement equality, ordering,
+//! hashing, and formatting. This makes owned SIDs suitable as map and set keys
+//! while still allowing lookup with a borrowed `&Sid`.
+//!
+//! # Creating SIDs
+//!
+//! Build a SID from its six-byte identifier authority and its sub-authorities:
+//!
+//! ```
+//! use safe_sid::SidBuf;
+//!
+//! // S-1-5-32-544 is the BUILTIN\Administrators SID.
+//! let administrators = SidBuf::new([0, 0, 0, 0, 0, 5], &[32, 544])?;
+//! assert_eq!(administrators.to_string(), "S-1-5-32-544");
+//! # Ok::<(), windows_core::Error>(())
+//! ```
+//!
+//! Or ask Windows to create a [well-known SID](well_known):
+//!
+//! ```
+//! use safe_sid::{SidBuf, WinLocalSystemSid};
+//!
+//! let local_system = SidBuf::well_known(WinLocalSystemSid, None)?;
+//! assert_eq!(local_system.to_string(), "S-1-5-18");
+//! # Ok::<(), windows_core::Error>(())
+//! ```
+//!
+//! Numeric SID strings can be parsed without calling Windows:
+//!
+//! ```
+//! use safe_sid::SidBuf;
+//!
+//! let sid: SidBuf = "S-1-5-18".parse()?;
+//! assert_eq!(sid.authority(), 5);
+//! assert_eq!(sid.sub_authorities(), [18]);
+//! # Ok::<(), safe_sid::ParseError>(())
+//! ```
+//!
+//! [`SidBuf::from_cstr_with_alias`] additionally accepts Windows aliases such
+//! as `BA` (BUILTIN\Administrators).
+//!
+//! # Windows API interoperability
+//!
+//! The default feature set has no dependency on the full `windows` crate.
+//! [`Sid::as_ptr`] and [`Sid::from_psid`] use raw `c_void` pointers in that
+//! configuration.
+//!
+//! Enable the `windows-full` feature to also accept and return
+//! [`windows::Win32::Security::PSID`] values directly:
+//!
+//! ```toml
+//! [dependencies]
+//! safe-sid = { version = "0.1", features = ["windows-full"] }
+//! windows = { version = "0.62", features = ["Win32_Security"] }
+//! ```
+//!
+//! A borrowed SID can be passed to an API for the duration of the call:
+//!
+//! ```
+//! # #[cfg(feature = "windows-full")]
+//! # {
+//! use safe_sid::SidBuf;
+//! use windows::Win32::Security::GetLengthSid;
+//!
+//! let sid: SidBuf = "S-1-5-18".parse().unwrap();
+//! // The API must not retain or mutate the borrowed pointer.
+//! let byte_len = unsafe { GetLengthSid(sid.as_psid()) };
+//! assert_eq!(byte_len as usize, sid.as_bytes().len());
+//! # }
+//! ```
+//!
+//! Use [`SidBuf::with_capacity`] and [`SidBuf::as_mut_ptr`] for APIs that fill
+//! a caller-supplied SID buffer. The usual Windows two-call pattern is:
+//!
+//! 1. Call the API with no buffer to obtain the required byte count.
+//! 2. Allocate that many bytes with [`SidBuf::with_capacity`].
+//! 3. Pass [`SidBuf::as_mut_ptr`] to the API.
+//! 4. Read the buffer only after the API has successfully written a valid SID.
+//!
+//! See [`SidBuf::as_mut_ptr`] for a complete buffer-filling example.
 
 use std::borrow::Borrow;
 use std::cmp::Ordering;
@@ -29,16 +116,22 @@ mod bindings {
     dead_code,
     clippy::all
 )]
+/// Constants for the SID types accepted by [`SidBuf::well_known`] and
+/// [`Sid::is_well_known`].
+///
+/// The names and values correspond to Windows'
+/// `WELL_KNOWN_SID_TYPE` enumeration.
 pub mod well_known {
     include!(concat!(env!("OUT_DIR"), "/well_known.rs"));
 }
 
+#[doc(no_inline)]
 pub use well_known::*;
 
 #[cfg(feature = "windows-full")]
 use windows::Win32::Security::{PSID, WELL_KNOWN_SID_TYPE as WINDOWS_WELL_KNOWN_SID_TYPE};
 
-const SID_REVISION: u8 = 1
+const SID_REVISION: u8 = 1;
 const SID_MAX_SUB_AUTHORITIES: u8 = 15;
 const SID_HEADER_WORDS: usize = 2;
 
@@ -47,12 +140,23 @@ fn invalid_sid_err() -> Error {
     Error::from_hresult(HRESULT::from_win32(0x0539))
 }
 
+/// Converts a supported pointer wrapper to the raw pointer used by SID APIs.
+///
+/// This trait lets [`Sid::from_psid`] and [`SidBuf::from_psid`] work with raw
+/// `c_void` pointers. With the `windows-full` feature they also accept
+/// [`windows::Win32::Security::PSID`].
 pub trait AsSidPtr {
+    /// Returns the wrapped SID pointer.
     fn as_sid_ptr(&self) -> *const c_void;
 }
 
-/// Converts a well-known SID type from either the raw bindings or the `windows` crate.
+/// Converts a well-known SID type to the value expected by Windows.
+///
+/// The crate's constants, such as [`WinLocalSystemSid`], implement this trait.
+/// With the `windows-full` feature, the equivalent constants from the
+/// `windows` crate do as well.
 pub trait AsWellKnownSidType {
+    /// Returns the numeric `WELL_KNOWN_SID_TYPE` value.
     fn as_well_known_sid_type(&self) -> WELL_KNOWN_SID_TYPE;
 }
 
@@ -90,10 +194,12 @@ impl AsSidPtr for *mut c_void {
 
 /// A borrowed SID.
 ///
-/// Byte-compatible with the Windows `SID` but set up as a dynamically-sized type.
+/// `Sid` is byte-compatible with the Windows `SID` structure but represented as
+/// a dynamically sized type. It is normally obtained by dereferencing a
+/// [`SidBuf`] or, when borrowing memory owned elsewhere, by calling
+/// [`Sid::from_psid`].
 ///
-/// Create one from a raw pointer with [`Sid::from_psid`] or
-/// obtain an owned copy with [`SidBuf`] and borrow it as `&Sid`.
+/// Use [`ToOwned::to_owned`] to copy a borrowed SID into a [`SidBuf`].
 #[repr(C)]
 pub struct Sid {
     revision: u8,
@@ -151,7 +257,11 @@ impl Sid {
         }
     }
 
-    /// The raw SID bytes.
+    /// Returns the logical SID as raw bytes.
+    ///
+    /// The slice contains the eight-byte header followed by four bytes for each
+    /// sub-authority. Spare capacity in a [`SidBuf::with_capacity`] allocation
+    /// is not included.
     #[inline]
     pub fn as_bytes(&self) -> &[u8] {
         let words = self.words();
@@ -171,24 +281,23 @@ impl Sid {
         }
     }
 
-    /// A `PSID` pointing at this SID, for passing to Windows APIs.
+    /// Returns a `PSID` pointing at this SID for use with Windows APIs.
     ///
     /// # Safety
     ///
-    /// The pointer borrows `self`, so it stays valid only as long as the `&Sid`
-    /// does. Although `PSID` wraps a mutable pointer, the SID must not be mutated
-    /// through it.
+    /// The returned pointer is borrowed from `self` and must not outlive it.
+    /// Although `PSID` contains a mutable pointer, the pointee must not be
+    /// mutated through this shared reference.
     #[cfg(feature = "windows-full")]
     #[inline]
     pub unsafe fn as_psid(&self) -> PSID {
         PSID(self as *const Sid as *mut _)
     }
 
-    /// A `PSID` pointing at this SID, for passing to Windows APIs.
+    /// Returns a raw pointer to this SID for use with Windows APIs.
     ///
-    /// # Safety
-    ///
-    /// The pointer borrows `self`, so it stays valid only as long as the `&Sid` does.
+    /// The pointer remains valid only while `self` is alive and has not been
+    /// mutably borrowed. The called API must not mutate the SID through it.
     pub fn as_ptr(&self) -> *const c_void {
         self as *const Sid as *const c_void
     }
@@ -200,9 +309,14 @@ impl Sid {
     /// # Safety
     ///
     /// `psid` must point to a readable SID that stays valid for `'a`. It must also be 4-byte
-    /// aligned since the words are  borrowed as `&[u32]`. The sub-authority count must be accurate
-    /// to prevent out-of bounds reads. Every SID Windows hands out is already aligned with a correct
+    /// aligned since the words are borrowed as `&[u32]`. The sub-authority count must be accurate
+    /// to prevent out-of-bounds reads. Every SID Windows hands out is already aligned with a correct
     /// count.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ERROR_INVALID_SID` if the revision or sub-authority count is
+    /// outside the range allowed by Windows.
     pub unsafe fn from_psid<'a>(psid: impl AsSidPtr) -> Result<&'a Sid> {
         let psid = psid.as_sid_ptr();
 
@@ -227,27 +341,34 @@ impl Sid {
         Ok(Sid::from_words_unchecked(words))
     }
 
+    /// Returns the SID revision.
+    ///
+    /// Valid Windows SIDs currently have revision 1.
     #[inline]
     pub fn revision(&self) -> u8 {
         self.revision
     }
 
+    /// Returns the number of sub-authorities recorded in the SID header.
     #[inline]
     pub fn sub_authority_count(&self) -> u8 {
         self.sub_authority_count
     }
 
+    /// Returns the 48-bit identifier authority as an integer.
     #[inline]
     pub fn authority(&self) -> u64 {
         let [a0, a1, a2, a3, a4, a5] = self.identifier_authority;
         u64::from_be_bytes([0, 0, a0, a1, a2, a3, a4, a5])
     }
 
+    /// Returns the sub-authority at `idx`, or `None` if it is out of bounds.
     #[inline]
     pub fn sub_authority(&self, idx: u8) -> Option<u32> {
         self.sub_authorities().get(idx as usize).copied()
     }
 
+    /// Returns all of the SID's sub-authorities.
     #[inline]
     pub fn sub_authorities(&self) -> &[u32] {
         &self.sub_authority[..self.logical_sub_count()]
@@ -277,6 +398,10 @@ impl Sid {
     /// Calls the Windows `EqualDomainSid` function.
     ///
     /// Both SIDs must be account-domain SIDs or BUILTIN SIDs.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error reported by `EqualDomainSid`.
     #[inline]
     pub fn equal_domain(&self, other: &Sid) -> Result<bool> {
         let mut equal = 0;
@@ -297,6 +422,10 @@ impl Sid {
     /// Returns the Windows account-domain SID containing this SID.
     ///
     /// Calls the Windows `GetWindowsAccountDomainSid` function.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error reported by `GetWindowsAccountDomainSid`.
     #[inline]
     pub fn account_domain_sid(&self) -> Result<SidBuf> {
         unsafe {
@@ -403,6 +532,23 @@ impl Debug for Sid {
 }
 
 /// An owned copy of a SID's bytes.
+///
+/// `SidBuf` dereferences to [`Sid`], so all borrowed-SID operations are
+/// available directly on an owned value. Clone a `SidBuf` to duplicate its
+/// bytes, or borrow it as `&Sid` without allocating.
+///
+/// # Examples
+///
+/// ```
+/// use safe_sid::{Sid, SidBuf};
+///
+/// let owned: SidBuf = "S-1-5-18".parse()?;
+/// let borrowed: &Sid = &owned;
+///
+/// assert_eq!(borrowed.to_string(), "S-1-5-18");
+/// assert_eq!(borrowed.to_owned(), owned);
+/// # Ok::<(), safe_sid::ParseError>(())
+/// ```
 pub struct SidBuf {
     sid: Box<Sid>,
 }
@@ -414,6 +560,9 @@ impl Clone for SidBuf {
 }
 
 #[derive(Debug)]
+/// The error returned when a string is not a valid numeric SID.
+///
+/// See [`SidBuf::from_str`](FromStr::from_str) for the accepted format.
 pub struct ParseError;
 
 impl std::error::Error for ParseError {}
@@ -488,6 +637,16 @@ impl SidBuf {
     /// Builds a SID from its identifier authority and sub-authorities.
     ///
     /// Returns `ERROR_INVALID_SID` if more than 15 sub-authorities are given.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use safe_sid::SidBuf;
+    ///
+    /// let administrators = SidBuf::new([0, 0, 0, 0, 0, 5], &[32, 544])?;
+    /// assert_eq!(administrators.to_string(), "S-1-5-32-544");
+    /// # Ok::<(), windows_core::Error>(())
+    /// ```
     pub fn new(identifier_authority: [u8; 6], sub_authorities: &[u32]) -> Result<Self> {
         let count = sub_authorities.len();
         if count > SID_MAX_SUB_AUTHORITIES as usize {
@@ -504,14 +663,14 @@ impl SidBuf {
         Ok(Self::from_boxed_words(words))
     }
 
-    /// Allocates a `SidBuf` of `len` bytes, initialized as the null SID (S-1-0-0)
-    /// for a Windows API to fill through [SidBuf::as_mut_ptr].
+    /// Allocates a `SidBuf` of `len` bytes for a Windows API to fill.
     ///
-    /// `len` is the total size of the SID structure in bytes. It is rounded up to the
-    /// next 4 byte boundary with a minimum of 12 bytes so it can represent the null SID.
+    /// The buffer initially contains the null SID (`S-1-0-0`). `len` is the
+    /// total requested size of the SID structure in bytes. It is rounded up to
+    /// the next four-byte boundary, with a minimum allocation of 12 bytes.
     ///
-    /// Note that the extra capacity will not be visible to consumers of the SID, the length
-    /// is driven off of [`Sid::sub_authority_count`].
+    /// Extra capacity is not exposed by [`Sid::as_bytes`]; the logical length is
+    /// determined by [`Sid::sub_authority_count`].
     pub fn with_capacity(len: usize) -> SidBuf {
         let word_len = len.div_ceil(size_of::<u32>()).max(SID_HEADER_WORDS + 1);
 
@@ -526,18 +685,92 @@ impl SidBuf {
     /// Returns a mutable pointer to this SID's bytes, for passing to a Windows API that
     /// fills a caller-supplied buffer.
     ///
+    /// This is intended for the second call of Windows APIs that first report a
+    /// required buffer length. Allocate that length with
+    /// [`SidBuf::with_capacity`], then pass this pointer to the API.
+    ///
     /// # Safety
     ///
     /// Writing through the pointer can leave the buffer holding bytes that are not
-    /// a valid SID. The caller must not write past the allocated
-    /// length (see [`SidBuf::with_capacity`]) and must leave a valid SID
-    /// behind before the buffer is read back through `&Sid`.
+    /// a valid SID. The caller must not write past the length supplied to
+    /// [`SidBuf::with_capacity`] and must leave a valid SID behind before the
+    /// buffer is read through `&Sid`. Dropping the buffer remains safe even if
+    /// the API fails or writes malformed data.
+    ///
+    /// # Examples
+    ///
+    /// This example uses the standard two-call pattern to look up an account
+    /// name. The first call obtains the two buffer lengths, and the second fills
+    /// the allocated SID and domain-name buffers.
+    ///
+    /// ```no_run
+    /// # #[cfg(feature = "windows-full")]
+    /// # {
+    /// use safe_sid::SidBuf;
+    /// use std::ffi::CStr;
+    /// use windows::Win32::Security::{LookupAccountNameA, PSID, SID_NAME_USE};
+    /// use windows_core::{HRESULT, PCSTR, PSTR, Result};
+    ///
+    /// fn lookup_account_name(name: &CStr) -> Result<SidBuf> {
+    ///     let mut sid_use = SID_NAME_USE::default();
+    ///     let mut sid_len = 0u32;
+    ///     let mut domain_len = 0u32;
+    ///
+    ///     unsafe {
+    ///         if let Err(error) = LookupAccountNameA(
+    ///             PCSTR::null(),
+    ///             PCSTR(name.as_ptr().cast()),
+    ///             None,
+    ///             &mut sid_len,
+    ///             None,
+    ///             &mut domain_len,
+    ///             &mut sid_use,
+    ///         ) && error.code() != HRESULT::from_win32(122) // ERROR_INSUFFICIENT_BUFFER
+    ///         {
+    ///             return Err(error);
+    ///         }
+    ///
+    ///         let mut sid = SidBuf::with_capacity(sid_len as usize);
+    ///         let mut domain = vec![0u8; domain_len as usize];
+    ///         LookupAccountNameA(
+    ///             PCSTR::null(),
+    ///             PCSTR(name.as_ptr().cast()),
+    ///             Some(PSID(sid.as_mut_ptr())),
+    ///             &mut sid_len,
+    ///             Some(PSTR(domain.as_mut_ptr())),
+    ///             &mut domain_len,
+    ///             &mut sid_use,
+    ///         )?;
+    ///         Ok(sid)
+    ///     }
+    /// }
+    ///
+    /// # let _ = lookup_account_name;
+    /// # }
+    /// ```
     pub unsafe fn as_mut_ptr(&mut self) -> *mut c_void {
         let sid: &mut Sid = &mut self.sid;
         sid as *mut Sid as *mut c_void
     }
 
     /// Builds a well-known SID with `CreateWellKnownSid`.
+    ///
+    /// `domain_sid` is required for well-known types whose value depends on a
+    /// Windows domain and should otherwise be `None`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error reported by `CreateWellKnownSid`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use safe_sid::{SidBuf, WinLocalSystemSid};
+    ///
+    /// let local_system = SidBuf::well_known(WinLocalSystemSid, None)?;
+    /// assert_eq!(local_system.to_string(), "S-1-5-18");
+    /// # Ok::<(), windows_core::Error>(())
+    /// ```
     pub fn well_known(
         well_known_type: impl AsWellKnownSidType,
         domain_sid: Option<&Sid>,
@@ -577,9 +810,25 @@ impl SidBuf {
         }
     }
 
-    /// Uses `ConvertStringSidToSidA` to convert a C-string to a SID.
-    /// Unlike [`SidBuf::from_str`] this supports SID aliases such as `AU`.
-    /// (Also more permissive, numbers get clamped to max instead of rejected.)
+    /// Converts a C string to a SID with `ConvertStringSidToSidA`.
+    ///
+    /// Unlike [`FromStr`], this accepts string constants such as `BA` and `AU`
+    /// in addition to numeric SIDs. Windows performs the parsing and may clamp
+    /// overflowing numeric components instead of rejecting them.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error reported by `ConvertStringSidToSidA`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use safe_sid::SidBuf;
+    ///
+    /// let administrators = SidBuf::from_cstr_with_alias(c"BA")?;
+    /// assert_eq!(administrators.to_string(), "S-1-5-32-544");
+    /// # Ok::<(), windows_core::Error>(())
+    /// ```
     pub fn from_cstr_with_alias(s: &std::ffi::CStr) -> Result<SidBuf> {
         unsafe {
             let mut sid = std::ptr::null_mut();
@@ -600,6 +849,21 @@ impl SidBuf {
     ///
     /// `psid` must point to a 4-byte-aligned SID structure valid for the duration of this
     /// call. The data is copied so there is no lifetime requirement for `psid` after this returns.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use safe_sid::{Sid, SidBuf};
+    ///
+    /// let source: SidBuf = "S-1-5-18".parse().unwrap();
+    ///
+    /// let borrowed: &Sid = unsafe { Sid::from_psid(source.as_ptr())? };
+    /// let copied = unsafe { SidBuf::from_psid(source.as_ptr())? };
+    ///
+    /// assert_eq!(borrowed, &*source);
+    /// assert_eq!(copied, source);
+    /// # Ok::<(), windows_core::Error>(())
+    /// ```
     pub unsafe fn from_psid(psid: impl AsSidPtr) -> Result<Self> {
         // SAFETY: safety requirements noted to called in the doc comment
         let src = unsafe { Sid::from_psid(psid) }?;
