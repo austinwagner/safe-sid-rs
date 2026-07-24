@@ -4,7 +4,7 @@ Safe wrapper for working with SIDs from the Windows API.
 
 Provides the borrowed/owned pair `&Sid` and `SidBuf` along with safe helper functions. Byte-compatible with the Windows `SID` struct. Defines equality and ordering traits so they can be compared and keyed on.
 
-Depends on the `windows` crate by default, but this can be reduced down to just `windows-core` by turning off default features.
+Only depends on the `windows-core` and `windows-link` crates by default. If you want to have functions accept and return `windows::Win32::Security::PSID`, enable the `windows-full` feature.
 
 ## Usage
 
@@ -13,12 +13,15 @@ Depends on the `windows` crate by default, but this can be reduced down to just 
 safe-sid = "0.1"
 ```
 
-Or for just the `windows-core` dependency:
+To accept and return `windows::Win32::Security::PSID` directly:
 
 ```toml
 [dependencies]
-safe-sid = { version = "0.1", default-features = false }
+safe-sid = { version = "0.1", features = ["windows-full"] }
+windows = { version = "0.62", features = ["Win32_Security"] }
 ```
+
+This allows `from_psid()` to accept the `PSID` type and enables the `as_psid()` function. Without it, you can still pass a raw `*const c_void` to `from_psid()` and get a similar raw pointer via `as_ptr()`.
 
 ### Build a SID by hand
 

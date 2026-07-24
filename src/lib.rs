@@ -11,8 +11,23 @@ use std::ops::Deref;
 use std::str::FromStr;
 use windows_core::{Error, HRESULT, Result};
 
+#[allow(
+    non_snake_case,
+    non_upper_case_globals,
+    non_camel_case_types,
+    dead_code,
+    clippy::all
+)]
+mod bindings {
+    include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
+}
+
+pub use bindings::{
+    WELL_KNOWN_SID_TYPE, WinBuiltinAdministratorsSid, WinLocalSystemSid, WinNullSid, WinWorldSid,
+};
+
 #[cfg(feature = "windows-full")]
-use windows::Win32::Security::PSID;
+use windows::Win32::Security::{PSID, WELL_KNOWN_SID_TYPE as WINDOWS_WELL_KNOWN_SID_TYPE};
 
 const SID_REVISION: u8 = 1;
 const SID_MAX_SUB_AUTHORITIES: u8 = 15;
@@ -25,6 +40,24 @@ pub fn invalid_sid_err() -> Error {
 
 pub trait AsSidPtr {
     fn as_sid_ptr(&self) -> *const c_void;
+}
+
+/// Converts a well-known SID type from either the raw bindings or the `windows` crate.
+pub trait AsWellKnownSidType {
+    fn as_well_known_sid_type(&self) -> WELL_KNOWN_SID_TYPE;
+}
+
+impl AsWellKnownSidType for WELL_KNOWN_SID_TYPE {
+    fn as_well_known_sid_type(&self) -> WELL_KNOWN_SID_TYPE {
+        *self
+    }
+}
+
+#[cfg(feature = "windows-full")]
+impl AsWellKnownSidType for WINDOWS_WELL_KNOWN_SID_TYPE {
+    fn as_well_known_sid_type(&self) -> WELL_KNOWN_SID_TYPE {
+        self.0
+    }
 }
 
 #[cfg(feature = "windows-full")]
@@ -225,7 +258,6 @@ impl Sid {
     /// Calls the Windows `EqualDomainSid` function.
     ///
     /// Both SIDs must be account-domain SIDs or BUILTIN SIDs.
-    #[cfg(feature = "windows-full")]
     #[inline]
     pub fn equal_domain(&self, other: &Sid) -> Result<bool> {
         equal_domain_sid(self, other)
@@ -234,7 +266,6 @@ impl Sid {
     /// Returns the Windows account-domain SID containing this SID.
     ///
     /// Calls the Windows `GetWindowsAccountDomainSid` function.
-    #[cfg(feature = "windows-full")]
     #[inline]
     pub fn account_domain_sid(&self) -> Result<SidBuf> {
         get_windows_account_domain_sid(self)
@@ -243,12 +274,8 @@ impl Sid {
     /// Tests whether this SID has the specified well-known SID type.
     ///
     /// Calls the Windows `IsWellKnownSid` function.
-    #[cfg(feature = "windows-full")]
     #[inline]
-    pub fn is_well_known(
-        &self,
-        well_known_type: windows::Win32::Security::WELL_KNOWN_SID_TYPE,
-    ) -> bool {
+    pub fn is_well_known(&self, well_known_type: impl AsWellKnownSidType) -> bool {
         is_well_known_sid(self, well_known_type)
     }
 }
@@ -278,36 +305,49 @@ pub fn equal_prefix_sid(sid1: &Sid, sid2: &Sid) -> bool {
 ///
 /// Both SIDs must be account-domain SIDs or BUILTIN SIDs. Returns an error when
 /// either SID is not one of those forms.
-#[cfg(feature = "windows-full")]
 pub fn equal_domain_sid(sid1: &Sid, sid2: &Sid) -> Result<bool> {
-    use windows::Win32::Security::EqualDomainSid;
-
-    let mut equal = windows_core::BOOL::default();
+    let mut equal = 0;
     // SAFETY: both pointers refer to valid SIDs and equal is a valid output pointer
-    unsafe {
-        EqualDomainSid(sid1.as_psid(), sid2.as_psid(), &mut equal)?;
+    if unsafe {
+        bindings::EqualDomainSid(
+            sid1.as_ptr().cast_mut(),
+            sid2.as_ptr().cast_mut(),
+            &mut equal,
+        )
+    } == 0
+    {
+        return Err(Error::from_thread());
     }
-    Ok(equal.as_bool())
+    Ok(equal != 0)
 }
 
 /// Returns the Windows account-domain SID containing `sid`.
 ///
 /// Calls the Windows `GetWindowsAccountDomainSid` function.
-#[cfg(feature = "windows-full")]
 pub fn get_windows_account_domain_sid(sid: &Sid) -> Result<SidBuf> {
-    use windows::Win32::Foundation::ERROR_INSUFFICIENT_BUFFER;
-    use windows::Win32::Security::GetWindowsAccountDomainSid;
-
     unsafe {
         let mut len = 0u32;
-        if let Err(error) = GetWindowsAccountDomainSid(sid.as_psid(), None, &mut len)
-            && error.code() != HRESULT::from_win32(ERROR_INSUFFICIENT_BUFFER.0)
+        if bindings::GetWindowsAccountDomainSid(
+            sid.as_ptr().cast_mut(),
+            std::ptr::null_mut(),
+            &mut len,
+        ) == 0
         {
-            return Err(error);
+            let error = Error::from_thread();
+            if error.code() != HRESULT::from_win32(bindings::ERROR_INSUFFICIENT_BUFFER) {
+                return Err(error);
+            }
         }
 
         let mut domain_sid = SidBuf::with_capacity(len as usize);
-        GetWindowsAccountDomainSid(sid.as_psid(), Some(PSID(domain_sid.as_mut_ptr())), &mut len)?;
+        if bindings::GetWindowsAccountDomainSid(
+            sid.as_ptr().cast_mut(),
+            domain_sid.as_mut_ptr(),
+            &mut len,
+        ) == 0
+        {
+            return Err(Error::from_thread());
+        }
         Ok(domain_sid)
     }
 }
@@ -315,15 +355,14 @@ pub fn get_windows_account_domain_sid(sid: &Sid) -> Result<SidBuf> {
 /// Tests whether `sid` has the specified well-known SID type.
 ///
 /// Calls the Windows `IsWellKnownSid` function.
-#[cfg(feature = "windows-full")]
-pub fn is_well_known_sid(
-    sid: &Sid,
-    well_known_type: windows::Win32::Security::WELL_KNOWN_SID_TYPE,
-) -> bool {
-    use windows::Win32::Security::IsWellKnownSid;
-
+pub fn is_well_known_sid(sid: &Sid, well_known_type: impl AsWellKnownSidType) -> bool {
     // SAFETY: sid supplies a valid SID pointer
-    unsafe { IsWellKnownSid(sid.as_psid(), well_known_type).as_bool() }
+    unsafe {
+        bindings::IsWellKnownSid(
+            sid.as_ptr().cast_mut(),
+            well_known_type.as_well_known_sid_type(),
+        ) != 0
+    }
 }
 
 impl ToOwned for Sid {
@@ -523,21 +562,40 @@ impl SidBuf {
     }
 
     /// Builds a well-known SID with `CreateWellKnownSid`.
-    #[cfg(feature = "windows-full")]
     pub fn well_known(
-        well_known_type: windows::Win32::Security::WELL_KNOWN_SID_TYPE,
+        well_known_type: impl AsWellKnownSidType,
         domain_sid: Option<&Sid>,
     ) -> Result<SidBuf> {
-        use windows::Win32::Security::CreateWellKnownSid;
         unsafe {
-            let domain_psid = domain_sid.map(|x| Sid::as_psid(x));
+            let well_known_type = well_known_type.as_well_known_sid_type();
+            let domain_psid = domain_sid
+                .map(|sid| sid.as_ptr().cast_mut())
+                .unwrap_or(std::ptr::null_mut());
             let mut len = 0u32;
-            let _ = CreateWellKnownSid(well_known_type, domain_psid, None, &mut len);
+            if bindings::CreateWellKnownSid(
+                well_known_type,
+                domain_psid,
+                std::ptr::null_mut(),
+                &mut len,
+            ) == 0
+            {
+                let error = Error::from_thread();
+                if error.code() != HRESULT::from_win32(bindings::ERROR_INSUFFICIENT_BUFFER) {
+                    return Err(error);
+                }
+            }
 
             let word_len = (len as usize).div_ceil(size_of::<u32>());
             let mut words: Box<[u32]> = vec![0u32; word_len].into_boxed_slice();
-            let psid = PSID(words.as_mut_ptr() as *mut _);
-            CreateWellKnownSid(well_known_type, domain_psid, Some(psid), &mut len)?;
+            if bindings::CreateWellKnownSid(
+                well_known_type,
+                domain_psid,
+                words.as_mut_ptr().cast(),
+                &mut len,
+            ) == 0
+            {
+                return Err(Error::from_thread());
+            }
 
             Ok(SidBuf::from_boxed_words(words))
         }
@@ -546,16 +604,14 @@ impl SidBuf {
     /// Uses `ConvertStringSidToSidA` to convert a C-string to a SID.
     /// Unlike [`SidBuf::from_str`] this supports SID aliases such as `AU`.
     /// (Also more permissive, numbers get clamped to max instead of rejected.)
-    #[cfg(feature = "windows-full")]
     pub fn from_cstr_with_alias(s: &std::ffi::CStr) -> Result<SidBuf> {
-        use windows::Win32::Foundation::{HLOCAL, LocalFree};
-        use windows::Win32::Security::Authorization::ConvertStringSidToSidA;
-        use windows::core::PCSTR;
         unsafe {
-            let mut sid = PSID::default();
-            ConvertStringSidToSidA(PCSTR(s.as_ptr() as *const u8), &mut sid)?;
+            let mut sid = std::ptr::null_mut();
+            if bindings::ConvertStringSidToSidA(s.as_ptr().cast(), &mut sid) == 0 {
+                return Err(Error::from_thread());
+            }
             let res = SidBuf::from_psid(sid);
-            LocalFree(Some(HLOCAL(sid.0)));
+            bindings::LocalFree(sid);
             res
         }
     }
@@ -688,13 +744,8 @@ mod tests {
         assert!(SidBuf::new([0; 6], &[0; 16]).is_err());
     }
 
-    #[cfg(feature = "windows-full")]
     #[test]
     fn well_known_sids_construct() {
-        use windows::Win32::Security::{
-            WinBuiltinAdministratorsSid, WinLocalSystemSid, WinNullSid,
-        };
-
         for (kind, expected) in [
             (WinNullSid, "S-1-0-0"),
             (WinLocalSystemSid, "S-1-5-18"),
@@ -743,6 +794,26 @@ mod tests {
         };
 
         assert_eq!(copied.to_string(), "S-1-5-18");
+    }
+
+    #[cfg(feature = "windows-full")]
+    #[test]
+    fn windows_psid_interoperates_when_enabled() {
+        let source = nt_sid(&[18]);
+        let psid = unsafe { source.as_psid() };
+
+        assert_eq!(unsafe { Sid::from_psid(psid) }.unwrap(), &*source);
+    }
+
+    #[cfg(feature = "windows-full")]
+    #[test]
+    fn windows_well_known_sid_types_interoperate_when_enabled() {
+        use windows::Win32::Security::WinLocalSystemSid as WindowsWinLocalSystemSid;
+
+        let local_system = SidBuf::well_known(WindowsWinLocalSystemSid, None).unwrap();
+
+        assert!(local_system.is_well_known(WindowsWinLocalSystemSid));
+        assert!(is_well_known_sid(&local_system, WindowsWinLocalSystemSid));
     }
 
     #[test]
@@ -897,7 +968,6 @@ mod tests {
         assert!(no_sub_authorities.equal_prefix(&no_sub_authorities));
     }
 
-    #[cfg(feature = "windows-full")]
     #[test]
     fn windows_domain_helpers_compare_and_extract_domains() {
         let first = nt_sid(&[21, 1, 2, 3, 1000]);
@@ -915,11 +985,8 @@ mod tests {
         assert_eq!(first.account_domain_sid().unwrap(), expected_domain);
     }
 
-    #[cfg(feature = "windows-full")]
     #[test]
     fn well_known_sid_helper_classifies_sids() {
-        use windows::Win32::Security::{WinLocalSystemSid, WinWorldSid};
-
         let local_system = nt_sid(&[18]);
         assert!(is_well_known_sid(&local_system, WinLocalSystemSid));
         assert!(local_system.is_well_known(WinLocalSystemSid));
@@ -938,7 +1005,6 @@ mod tests {
         assert_eq!(map.get(probe), Some(&"LocalSystem"));
     }
 
-    #[cfg(feature = "windows-full")]
     #[test]
     fn from_cstr_supports_numeric_and_aliases() {
         let ba = nt_sid(&[32, 544]);
@@ -946,7 +1012,6 @@ mod tests {
         assert_eq!(SidBuf::from_cstr_with_alias(c"S-1-5-32-544").unwrap(), ba);
     }
 
-    #[cfg(feature = "windows-full")]
     #[test]
     fn from_cstr_fails_on_bad_input() {
         assert!(SidBuf::from_cstr_with_alias(c"").is_err());

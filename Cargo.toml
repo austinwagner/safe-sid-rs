@@ -15,13 +15,15 @@ targets = ["x86_64-pc-windows-msvc"]
 rustdoc-args = ["--cfg", "docsrs"]
 
 [features]
-default = ["windows-full"]
+default = []
 windows-full = ["dep:windows"]
 
 [dependencies]
 windows-core = "0.62"
-windows = { version = "0.62", optional = true, features = [
-    "Win32_Foundation",
+windows-link = "0.2"
+windows = { version = "0.62", optional = true, default-features = false, features = [
     "Win32_Security",
-    "Win32_Security_Authorization",
 ] }
+
+[build-dependencies]
+windows-bindgen = "0.63"
