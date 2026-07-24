@@ -22,14 +22,23 @@ mod bindings {
     include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 }
 
-pub use bindings::{
-    WELL_KNOWN_SID_TYPE, WinBuiltinAdministratorsSid, WinLocalSystemSid, WinNullSid, WinWorldSid,
-};
+#[allow(
+    non_snake_case,
+    non_upper_case_globals,
+    non_camel_case_types,
+    dead_code,
+    clippy::all
+)]
+pub mod well_known {
+    include!(concat!(env!("OUT_DIR"), "/well_known.rs"));
+}
+
+pub use well_known::*;
 
 #[cfg(feature = "windows-full")]
 use windows::Win32::Security::{PSID, WELL_KNOWN_SID_TYPE as WINDOWS_WELL_KNOWN_SID_TYPE};
 
-const SID_REVISION: u8 = 1;
+const SID_REVISION: u8 = 1
 const SID_MAX_SUB_AUTHORITIES: u8 = 15;
 const SID_HEADER_WORDS: usize = 2;
 
