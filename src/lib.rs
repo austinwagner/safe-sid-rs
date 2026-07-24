@@ -1,3 +1,5 @@
+#![cfg_attr(docsrs, feature(doc_cfg))]
+
 //! Safe, borrowed/owned wrappers over a Windows security identifier (SID).
 
 use std::borrow::Borrow;
@@ -223,8 +225,6 @@ impl Sid {
     /// Calls the Windows `EqualDomainSid` function.
     ///
     /// Both SIDs must be account-domain SIDs or BUILTIN SIDs.
-    ///
-    /// Requires the `windows-full` feature.
     #[cfg(feature = "windows-full")]
     #[inline]
     pub fn equal_domain(&self, other: &Sid) -> Result<bool> {
@@ -234,8 +234,6 @@ impl Sid {
     /// Returns the Windows account-domain SID containing this SID.
     ///
     /// Calls the Windows `GetWindowsAccountDomainSid` function.
-    ///
-    /// Requires the `windows-full` feature.
     #[cfg(feature = "windows-full")]
     #[inline]
     pub fn account_domain_sid(&self) -> Result<SidBuf> {
@@ -245,8 +243,6 @@ impl Sid {
     /// Tests whether this SID has the specified well-known SID type.
     ///
     /// Calls the Windows `IsWellKnownSid` function.
-    ///
-    /// Requires the `windows-full` feature.
     #[cfg(feature = "windows-full")]
     #[inline]
     pub fn is_well_known(
@@ -282,8 +278,6 @@ pub fn equal_prefix_sid(sid1: &Sid, sid2: &Sid) -> bool {
 ///
 /// Both SIDs must be account-domain SIDs or BUILTIN SIDs. Returns an error when
 /// either SID is not one of those forms.
-///
-/// Requires the `windows-full` feature.
 #[cfg(feature = "windows-full")]
 pub fn equal_domain_sid(sid1: &Sid, sid2: &Sid) -> Result<bool> {
     use windows::Win32::Security::EqualDomainSid;
@@ -299,8 +293,6 @@ pub fn equal_domain_sid(sid1: &Sid, sid2: &Sid) -> Result<bool> {
 /// Returns the Windows account-domain SID containing `sid`.
 ///
 /// Calls the Windows `GetWindowsAccountDomainSid` function.
-///
-/// Requires the `windows-full` feature.
 #[cfg(feature = "windows-full")]
 pub fn get_windows_account_domain_sid(sid: &Sid) -> Result<SidBuf> {
     use windows::Win32::Foundation::ERROR_INSUFFICIENT_BUFFER;
@@ -323,8 +315,6 @@ pub fn get_windows_account_domain_sid(sid: &Sid) -> Result<SidBuf> {
 /// Tests whether `sid` has the specified well-known SID type.
 ///
 /// Calls the Windows `IsWellKnownSid` function.
-///
-/// Requires the `windows-full` feature.
 #[cfg(feature = "windows-full")]
 pub fn is_well_known_sid(
     sid: &Sid,
@@ -533,8 +523,6 @@ impl SidBuf {
     }
 
     /// Builds a well-known SID with `CreateWellKnownSid`.
-    ///
-    /// Requires the `windows-full` feature.
     #[cfg(feature = "windows-full")]
     pub fn well_known(
         well_known_type: windows::Win32::Security::WELL_KNOWN_SID_TYPE,
@@ -558,8 +546,6 @@ impl SidBuf {
     /// Uses `ConvertStringSidToSidA` to convert a C-string to a SID.
     /// Unlike [`SidBuf::from_str`] this supports SID aliases such as `AU`.
     /// (Also more permissive, numbers get clamped to max instead of rejected.)
-    ///
-    /// Requires the `windows-full` feature.
     #[cfg(feature = "windows-full")]
     pub fn from_cstr_with_alias(s: &std::ffi::CStr) -> Result<SidBuf> {
         use windows::Win32::Foundation::{HLOCAL, LocalFree};
