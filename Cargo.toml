@@ -8,6 +8,10 @@ keywords = ["windows", "security", "SID"]
 categories = ["api-bindings", "os::windows-apis"]
 repository = "https://github.com/austinwagner/safe-sid-rs"
 
+[package.metadata.docs.rs]
+default-target = "x86_64-pc-windows-msvc"
+targets = []
+
 [features]
 default = ["windows-full"]
 windows-full = ["dep:windows"]
