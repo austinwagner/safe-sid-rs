@@ -34,7 +34,7 @@ const SID_MAX_SUB_AUTHORITIES: u8 = 15;
 const SID_HEADER_WORDS: usize = 2;
 
 /// Creates an error representing `ERROR_INVALID_SID`.
-pub fn invalid_sid_err() -> Error {
+fn invalid_sid_err() -> Error {
     Error::from_hresult(HRESULT::from_win32(0x0539))
 }
 
@@ -250,7 +250,17 @@ impl Sid {
     /// count, and every sub-authority except the last.
     #[inline]
     pub fn equal_prefix(&self, other: &Sid) -> bool {
-        equal_prefix_sid(self, other)
+        self.revision == other.revision
+            && self.identifier_authority == other.identifier_authority
+            && self.sub_authority_count == other.sub_authority_count
+            && match (
+                self.sub_authorities().split_last(),
+                other.sub_authorities().split_last(),
+            ) {
+                (Some((_, prefix1)), Some((_, prefix2))) => prefix1 == prefix2,
+                (None, None) => true,
+                _ => false,
+            }
     }
 
     /// Determines whether this SID and `other` belong to the same Windows account domain.
@@ -260,7 +270,19 @@ impl Sid {
     /// Both SIDs must be account-domain SIDs or BUILTIN SIDs.
     #[inline]
     pub fn equal_domain(&self, other: &Sid) -> Result<bool> {
-        equal_domain_sid(self, other)
+        let mut equal = 0;
+        // SAFETY: both pointers refer to valid SIDs and equal is a valid output pointer
+        if unsafe {
+            bindings::EqualDomainSid(
+                self.as_ptr().cast_mut(),
+                other.as_ptr().cast_mut(),
+                &mut equal,
+            )
+        } == 0
+        {
+            return Err(Error::from_thread());
+        }
+        Ok(equal != 0)
     }
 
     /// Returns the Windows account-domain SID containing this SID.
@@ -268,7 +290,31 @@ impl Sid {
     /// Calls the Windows `GetWindowsAccountDomainSid` function.
     #[inline]
     pub fn account_domain_sid(&self) -> Result<SidBuf> {
-        get_windows_account_domain_sid(self)
+        unsafe {
+            let mut len = 0u32;
+            if bindings::GetWindowsAccountDomainSid(
+                self.as_ptr().cast_mut(),
+                std::ptr::null_mut(),
+                &mut len,
+            ) == 0
+            {
+                let error = Error::from_thread();
+                if error.code() != HRESULT::from_win32(bindings::ERROR_INSUFFICIENT_BUFFER) {
+                    return Err(error);
+                }
+            }
+
+            let mut domain_sid = SidBuf::with_capacity(len as usize);
+            if bindings::GetWindowsAccountDomainSid(
+                self.as_ptr().cast_mut(),
+                domain_sid.as_mut_ptr(),
+                &mut len,
+            ) == 0
+            {
+                return Err(Error::from_thread());
+            }
+            Ok(domain_sid)
+        }
     }
 
     /// Tests whether this SID has the specified well-known SID type.
@@ -276,92 +322,13 @@ impl Sid {
     /// Calls the Windows `IsWellKnownSid` function.
     #[inline]
     pub fn is_well_known(&self, well_known_type: impl AsWellKnownSidType) -> bool {
-        is_well_known_sid(self, well_known_type)
-    }
-}
-
-/// Tests whether two SIDs have equal prefixes.
-///
-/// This is the safe equivalent of the Windows `EqualPrefixSid` function. A SID
-/// prefix contains the entire SID except for its last sub-authority.
-#[inline]
-pub fn equal_prefix_sid(sid1: &Sid, sid2: &Sid) -> bool {
-    sid1.revision == sid2.revision
-        && sid1.identifier_authority == sid2.identifier_authority
-        && sid1.sub_authority_count == sid2.sub_authority_count
-        && match (
-            sid1.sub_authorities().split_last(),
-            sid2.sub_authorities().split_last(),
-        ) {
-            (Some((_, prefix1)), Some((_, prefix2))) => prefix1 == prefix2,
-            (None, None) => true,
-            _ => false,
+        // SAFETY: self supplies a valid SID pointer
+        unsafe {
+            bindings::IsWellKnownSid(
+                self.as_ptr().cast_mut(),
+                well_known_type.as_well_known_sid_type(),
+            ) != 0
         }
-}
-
-/// Determines whether two SIDs belong to the same Windows account domain.
-///
-/// Calls the Windows `EqualDomainSid` function.
-///
-/// Both SIDs must be account-domain SIDs or BUILTIN SIDs. Returns an error when
-/// either SID is not one of those forms.
-pub fn equal_domain_sid(sid1: &Sid, sid2: &Sid) -> Result<bool> {
-    let mut equal = 0;
-    // SAFETY: both pointers refer to valid SIDs and equal is a valid output pointer
-    if unsafe {
-        bindings::EqualDomainSid(
-            sid1.as_ptr().cast_mut(),
-            sid2.as_ptr().cast_mut(),
-            &mut equal,
-        )
-    } == 0
-    {
-        return Err(Error::from_thread());
-    }
-    Ok(equal != 0)
-}
-
-/// Returns the Windows account-domain SID containing `sid`.
-///
-/// Calls the Windows `GetWindowsAccountDomainSid` function.
-pub fn get_windows_account_domain_sid(sid: &Sid) -> Result<SidBuf> {
-    unsafe {
-        let mut len = 0u32;
-        if bindings::GetWindowsAccountDomainSid(
-            sid.as_ptr().cast_mut(),
-            std::ptr::null_mut(),
-            &mut len,
-        ) == 0
-        {
-            let error = Error::from_thread();
-            if error.code() != HRESULT::from_win32(bindings::ERROR_INSUFFICIENT_BUFFER) {
-                return Err(error);
-            }
-        }
-
-        let mut domain_sid = SidBuf::with_capacity(len as usize);
-        if bindings::GetWindowsAccountDomainSid(
-            sid.as_ptr().cast_mut(),
-            domain_sid.as_mut_ptr(),
-            &mut len,
-        ) == 0
-        {
-            return Err(Error::from_thread());
-        }
-        Ok(domain_sid)
-    }
-}
-
-/// Tests whether `sid` has the specified well-known SID type.
-///
-/// Calls the Windows `IsWellKnownSid` function.
-pub fn is_well_known_sid(sid: &Sid, well_known_type: impl AsWellKnownSidType) -> bool {
-    // SAFETY: sid supplies a valid SID pointer
-    unsafe {
-        bindings::IsWellKnownSid(
-            sid.as_ptr().cast_mut(),
-            well_known_type.as_well_known_sid_type(),
-        ) != 0
     }
 }
 
@@ -813,7 +780,6 @@ mod tests {
         let local_system = SidBuf::well_known(WindowsWinLocalSystemSid, None).unwrap();
 
         assert!(local_system.is_well_known(WindowsWinLocalSystemSid));
-        assert!(is_well_known_sid(&local_system, WindowsWinLocalSystemSid));
     }
 
     #[test]
@@ -958,7 +924,6 @@ mod tests {
         let different_count = nt_sid(&[21, 1, 2, 3]);
         let different_authority = SidBuf::new([0, 0, 0, 0, 0, 4], &[21, 1, 2, 3, 2000]).unwrap();
 
-        assert!(equal_prefix_sid(&first, &same_prefix));
         assert!(first.equal_prefix(&same_prefix));
         assert!(!first.equal_prefix(&different_prefix));
         assert!(!first.equal_prefix(&different_count));
@@ -975,20 +940,14 @@ mod tests {
         let different_domain = nt_sid(&[21, 1, 2, 4, 1000]);
         let expected_domain = nt_sid(&[21, 1, 2, 3]);
 
-        assert!(equal_domain_sid(&first, &same_domain).unwrap());
         assert!(first.equal_domain(&same_domain).unwrap());
         assert!(!first.equal_domain(&different_domain).unwrap());
-        assert_eq!(
-            get_windows_account_domain_sid(&first).unwrap(),
-            expected_domain
-        );
         assert_eq!(first.account_domain_sid().unwrap(), expected_domain);
     }
 
     #[test]
     fn well_known_sid_helper_classifies_sids() {
         let local_system = nt_sid(&[18]);
-        assert!(is_well_known_sid(&local_system, WinLocalSystemSid));
         assert!(local_system.is_well_known(WinLocalSystemSid));
         assert!(!local_system.is_well_known(WinWorldSid));
     }
