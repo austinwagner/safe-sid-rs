@@ -1,6 +1,6 @@
 [package]
 name = "safe-sid"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Safe borrowed/owned wrappers over a Windows security identifier (SID)."
 license = "ISC"
