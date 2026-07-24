@@ -208,6 +208,132 @@ impl Sid {
     pub fn sub_authorities(&self) -> &[u32] {
         &self.sub_authority[..self.logical_sub_count()]
     }
+
+    /// Tests whether this SID and `other` have equal prefixes.
+    ///
+    /// A SID prefix contains the revision, identifier authority, sub-authority
+    /// count, and every sub-authority except the last.
+    #[inline]
+    pub fn equal_prefix(&self, other: &Sid) -> bool {
+        equal_prefix_sid(self, other)
+    }
+
+    /// Determines whether this SID and `other` belong to the same Windows account domain.
+    ///
+    /// Calls the Windows `EqualDomainSid` function.
+    ///
+    /// Both SIDs must be account-domain SIDs or BUILTIN SIDs.
+    ///
+    /// Requires the `windows-full` feature.
+    #[cfg(feature = "windows-full")]
+    #[inline]
+    pub fn equal_domain(&self, other: &Sid) -> Result<bool> {
+        equal_domain_sid(self, other)
+    }
+
+    /// Returns the Windows account-domain SID containing this SID.
+    ///
+    /// Calls the Windows `GetWindowsAccountDomainSid` function.
+    ///
+    /// Requires the `windows-full` feature.
+    #[cfg(feature = "windows-full")]
+    #[inline]
+    pub fn account_domain_sid(&self) -> Result<SidBuf> {
+        get_windows_account_domain_sid(self)
+    }
+
+    /// Tests whether this SID has the specified well-known SID type.
+    ///
+    /// Calls the Windows `IsWellKnownSid` function.
+    ///
+    /// Requires the `windows-full` feature.
+    #[cfg(feature = "windows-full")]
+    #[inline]
+    pub fn is_well_known(
+        &self,
+        well_known_type: windows::Win32::Security::WELL_KNOWN_SID_TYPE,
+    ) -> bool {
+        is_well_known_sid(self, well_known_type)
+    }
+}
+
+/// Tests whether two SIDs have equal prefixes.
+///
+/// This is the safe equivalent of the Windows `EqualPrefixSid` function. A SID
+/// prefix contains the entire SID except for its last sub-authority.
+#[inline]
+pub fn equal_prefix_sid(sid1: &Sid, sid2: &Sid) -> bool {
+    sid1.revision == sid2.revision
+        && sid1.identifier_authority == sid2.identifier_authority
+        && sid1.sub_authority_count == sid2.sub_authority_count
+        && match (
+            sid1.sub_authorities().split_last(),
+            sid2.sub_authorities().split_last(),
+        ) {
+            (Some((_, prefix1)), Some((_, prefix2))) => prefix1 == prefix2,
+            (None, None) => true,
+            _ => false,
+        }
+}
+
+/// Determines whether two SIDs belong to the same Windows account domain.
+///
+/// Calls the Windows `EqualDomainSid` function.
+///
+/// Both SIDs must be account-domain SIDs or BUILTIN SIDs. Returns an error when
+/// either SID is not one of those forms.
+///
+/// Requires the `windows-full` feature.
+#[cfg(feature = "windows-full")]
+pub fn equal_domain_sid(sid1: &Sid, sid2: &Sid) -> Result<bool> {
+    use windows::Win32::Security::EqualDomainSid;
+
+    let mut equal = windows_core::BOOL::default();
+    // SAFETY: both pointers refer to valid SIDs and equal is a valid output pointer
+    unsafe {
+        EqualDomainSid(sid1.as_psid(), sid2.as_psid(), &mut equal)?;
+    }
+    Ok(equal.as_bool())
+}
+
+/// Returns the Windows account-domain SID containing `sid`.
+///
+/// Calls the Windows `GetWindowsAccountDomainSid` function.
+///
+/// Requires the `windows-full` feature.
+#[cfg(feature = "windows-full")]
+pub fn get_windows_account_domain_sid(sid: &Sid) -> Result<SidBuf> {
+    use windows::Win32::Foundation::ERROR_INSUFFICIENT_BUFFER;
+    use windows::Win32::Security::GetWindowsAccountDomainSid;
+
+    unsafe {
+        let mut len = 0u32;
+        if let Err(error) = GetWindowsAccountDomainSid(sid.as_psid(), None, &mut len)
+            && error.code() != HRESULT::from_win32(ERROR_INSUFFICIENT_BUFFER.0)
+        {
+            return Err(error);
+        }
+
+        let mut domain_sid = SidBuf::with_capacity(len as usize);
+        GetWindowsAccountDomainSid(sid.as_psid(), Some(PSID(domain_sid.as_mut_ptr())), &mut len)?;
+        Ok(domain_sid)
+    }
+}
+
+/// Tests whether `sid` has the specified well-known SID type.
+///
+/// Calls the Windows `IsWellKnownSid` function.
+///
+/// Requires the `windows-full` feature.
+#[cfg(feature = "windows-full")]
+pub fn is_well_known_sid(
+    sid: &Sid,
+    well_known_type: windows::Win32::Security::WELL_KNOWN_SID_TYPE,
+) -> bool {
+    use windows::Win32::Security::IsWellKnownSid;
+
+    // SAFETY: sid supplies a valid SID pointer
+    unsafe { IsWellKnownSid(sid.as_psid(), well_known_type).as_bool() }
 }
 
 impl ToOwned for Sid {
@@ -765,6 +891,53 @@ mod tests {
         assert_ne!(a, c);
 
         assert!(a < nt_sid(&[32, 544]));
+    }
+
+    #[test]
+    fn equal_prefix_ignores_only_the_last_sub_authority() {
+        let first = nt_sid(&[21, 1, 2, 3, 1000]);
+        let same_prefix = nt_sid(&[21, 1, 2, 3, 2000]);
+        let different_prefix = nt_sid(&[21, 1, 2, 4, 1000]);
+        let different_count = nt_sid(&[21, 1, 2, 3]);
+        let different_authority = SidBuf::new([0, 0, 0, 0, 0, 4], &[21, 1, 2, 3, 2000]).unwrap();
+
+        assert!(equal_prefix_sid(&first, &same_prefix));
+        assert!(first.equal_prefix(&same_prefix));
+        assert!(!first.equal_prefix(&different_prefix));
+        assert!(!first.equal_prefix(&different_count));
+        assert!(!first.equal_prefix(&different_authority));
+
+        let no_sub_authorities = SidBuf::new(NT_AUTHORITY, &[]).unwrap();
+        assert!(no_sub_authorities.equal_prefix(&no_sub_authorities));
+    }
+
+    #[cfg(feature = "windows-full")]
+    #[test]
+    fn windows_domain_helpers_compare_and_extract_domains() {
+        let first = nt_sid(&[21, 1, 2, 3, 1000]);
+        let same_domain = nt_sid(&[21, 1, 2, 3, 2000]);
+        let different_domain = nt_sid(&[21, 1, 2, 4, 1000]);
+        let expected_domain = nt_sid(&[21, 1, 2, 3]);
+
+        assert!(equal_domain_sid(&first, &same_domain).unwrap());
+        assert!(first.equal_domain(&same_domain).unwrap());
+        assert!(!first.equal_domain(&different_domain).unwrap());
+        assert_eq!(
+            get_windows_account_domain_sid(&first).unwrap(),
+            expected_domain
+        );
+        assert_eq!(first.account_domain_sid().unwrap(), expected_domain);
+    }
+
+    #[cfg(feature = "windows-full")]
+    #[test]
+    fn well_known_sid_helper_classifies_sids() {
+        use windows::Win32::Security::{WinLocalSystemSid, WinWorldSid};
+
+        let local_system = nt_sid(&[18]);
+        assert!(is_well_known_sid(&local_system, WinLocalSystemSid));
+        assert!(local_system.is_well_known(WinLocalSystemSid));
+        assert!(!local_system.is_well_known(WinWorldSid));
     }
 
     #[test]
