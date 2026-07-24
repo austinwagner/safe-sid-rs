@@ -56,7 +56,8 @@
 //! configuration.
 //!
 //! Enable the `windows-full` feature to also accept and return
-//! [`windows::Win32::Security::PSID`] values directly:
+//! [`windows::Win32::Security::PSID`](https://microsoft.github.io/windows-docs-rs/doc/windows/Win32/Security/struct.PSID.html)
+//! values directly:
 //!
 //! ```toml
 //! [dependencies]
@@ -144,7 +145,7 @@ fn invalid_sid_err() -> Error {
 ///
 /// This trait lets [`Sid::from_psid`] and [`SidBuf::from_psid`] work with raw
 /// `c_void` pointers. With the `windows-full` feature they also accept
-/// [`windows::Win32::Security::PSID`].
+/// [`windows::Win32::Security::PSID`](https://microsoft.github.io/windows-docs-rs/doc/windows/Win32/Security/struct.PSID.html).
 pub trait AsSidPtr {
     /// Returns the wrapped SID pointer.
     fn as_sid_ptr(&self) -> *const c_void;
