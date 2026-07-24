@@ -1,7 +1,8 @@
 [package]
 name = "safe-sid"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
+rust-version = "1.88"
 description = "Safe borrowed/owned wrappers over a Windows security identifier (SID)."
 license = "ISC"
 keywords = ["windows", "security", "SID"]
