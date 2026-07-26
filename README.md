@@ -14,7 +14,7 @@ It supports Windows targets and requires Rust 1.88 or newer.
 
 ```toml
 [dependencies]
-safe-sid = "0.2"
+safe-sid = "1.0.0"
 ```
 
 ```rust
