@@ -908,7 +908,9 @@ impl SidBuf {
                 }
             }
 
-            let word_len = (len as usize).div_ceil(size_of::<u32>());
+            let word_len = (len as usize)
+                .div_ceil(size_of::<u32>())
+                .max(SID_HEADER_WORDS);
             let mut words: Box<[u32]> = vec![0u32; word_len].into_boxed_slice();
             if bindings::CreateWellKnownSid(
                 well_known_type.0,
