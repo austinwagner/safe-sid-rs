@@ -14,25 +14,29 @@
 //!
 //! # Creating SIDs
 //!
-//! Build a SID from its six-byte identifier authority and its sub-authorities:
+//! Build a SID from its identifier authority and its sub-authorities. The
+//! authority can be one of the constants in [`authority`], its raw six-byte
+//! form, or a plain integer:
 //!
 //! ```
 //! use safe_sid::SidBuf;
+//! use safe_sid::authority::SECURITY_NT_AUTHORITY;
 //!
 //! // S-1-5-32-544 is the BUILTIN\Administrators SID.
-//! let administrators = SidBuf::new([0, 0, 0, 0, 0, 5], &[32, 544])?;
+//! let administrators = SidBuf::new(SECURITY_NT_AUTHORITY, &[32, 544])?;
 //! assert_eq!(administrators.to_string(), "S-1-5-32-544");
-//! # Ok::<(), windows_core::Error>(())
+//! # Ok::<(), safe_sid::Error>(())
 //! ```
 //!
 //! Or ask Windows to create a [well-known SID](well_known):
 //!
 //! ```
-//! use safe_sid::{SidBuf, WinLocalSystemSid};
+//! use safe_sid::SidBuf;
+//! use safe_sid::well_known::WinLocalSystemSid;
 //!
 //! let local_system = SidBuf::well_known(WinLocalSystemSid, None)?;
 //! assert_eq!(local_system.to_string(), "S-1-5-18");
-//! # Ok::<(), windows_core::Error>(())
+//! # Ok::<(), safe_sid::Error>(())
 //! ```
 //!
 //! Numeric SID strings can be parsed without calling Windows:
@@ -43,41 +47,28 @@
 //! let sid: SidBuf = "S-1-5-18".parse()?;
 //! assert_eq!(sid.authority(), 5);
 //! assert_eq!(sid.sub_authorities(), [18]);
-//! # Ok::<(), safe_sid::ParseError>(())
+//! # Ok::<(), safe_sid::SidParseError>(())
 //! ```
 //!
-//! [`SidBuf::from_cstr_with_alias`] additionally accepts Windows aliases such
+//! [`SidBuf::from_string_sid`] additionally accepts Windows aliases such
 //! as `BA` (BUILTIN\Administrators).
 //!
 //! # Windows API interoperability
 //!
-//! The default feature set has no dependency on the full `windows` crate.
-//! [`Sid::as_ptr`] and [`Sid::from_psid`] use raw `c_void` pointers in that
-//! configuration.
-//!
-//! Enable the `windows-full` feature to also accept and return
-//! [`windows::Win32::Security::PSID`](https://microsoft.github.io/windows-docs-rs/doc/windows/Win32/Security/struct.PSID.html)
-//! values directly:
-//!
-//! ```toml
-//! [dependencies]
-//! safe-sid = { version = "0.1", features = ["windows-full"] }
-//! windows = { version = "0.62", features = ["Win32_Security"] }
-//! ```
+//! This crate does not depend on the `windows` crate. [`Sid::as_ptr`] and
+//! [`Sid::from_psid`] use raw `c_void` pointers so applications can choose
+//! their own Windows bindings and versions.
 //!
 //! A borrowed SID can be passed to an API for the duration of the call:
 //!
 //! ```
-//! # #[cfg(feature = "windows-full")]
-//! # {
 //! use safe_sid::SidBuf;
-//! use windows::Win32::Security::GetLengthSid;
+//! use windows::Win32::Security::{GetLengthSid, PSID};
 //!
 //! let sid: SidBuf = "S-1-5-18".parse().unwrap();
 //! // The API must not retain or mutate the borrowed pointer.
-//! let byte_len = unsafe { GetLengthSid(sid.as_psid()) };
+//! let byte_len = unsafe { GetLengthSid(PSID(sid.as_ptr().cast_mut())) };
 //! assert_eq!(byte_len as usize, sid.as_bytes().len());
-//! # }
 //! ```
 //!
 //! Use [`SidBuf::with_capacity`] and [`SidBuf::as_mut_ptr`] for APIs that fill
@@ -97,55 +88,118 @@ use std::fmt::{Debug, Display};
 use std::hash::{Hash, Hasher};
 use std::ops::Deref;
 use std::str::FromStr;
-use windows_core::{Error, HRESULT, Result};
 
-#[allow(
-    non_snake_case,
-    non_upper_case_globals,
-    non_camel_case_types,
-    dead_code,
-    clippy::all
-)]
-mod bindings {
-    include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
-}
+#[allow(non_snake_case, non_camel_case_types, dead_code, clippy::all)]
+mod bindings;
 
-#[allow(
-    non_snake_case,
-    non_upper_case_globals,
-    non_camel_case_types,
-    dead_code,
-    clippy::all
-)]
+#[allow(non_upper_case_globals)]
 /// Constants for the SID types accepted by [`SidBuf::well_known`] and
 /// [`Sid::is_well_known`].
 ///
 /// The names and values correspond to Windows'
 /// `WELL_KNOWN_SID_TYPE` enumeration.
-pub mod well_known {
-    include!(concat!(env!("OUT_DIR"), "/well_known.rs"));
-}
+pub mod well_known;
 
-#[doc(no_inline)]
-pub use well_known::*;
+/// Constants for the identifier authorities defined by Windows, for use with
+/// [`SidBuf::new`].
+///
+/// The names and values correspond to Windows'
+/// `SECURITY_*_AUTHORITY` constants.
+pub mod authority;
 
-#[cfg(feature = "windows-full")]
-use windows::Win32::Security::{PSID, WELL_KNOWN_SID_TYPE as WINDOWS_WELL_KNOWN_SID_TYPE};
+/// A Windows well-known SID type.
+///
+/// Values of this type are exposed as the named constants in [`well_known`],
+/// such as [`well_known::WinLocalSystemSid`]. The integer accepted by the
+/// underlying Windows APIs is intentionally not part of this crate's public
+/// API, so arbitrary integers cannot be used as well-known SID types.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[repr(transparent)]
+pub struct WellKnownSidType(i32);
 
 const SID_REVISION: u8 = 1;
 const SID_MAX_SUB_AUTHORITIES: u8 = 15;
 const SID_HEADER_WORDS: usize = 2;
+const ERROR_INVALID_SID: u32 = 0x0539;
+const MAX_AUTHORITY: u64 = 0xFFFF_FFFF_FFFF;
 
-/// Creates an error representing `ERROR_INVALID_SID`.
-fn invalid_sid_err() -> Error {
-    Error::from_hresult(HRESULT::from_win32(0x0539))
+/// An error reported while creating, validating, or querying a SID.
+///
+/// Failures detected by this crate are reported as descriptive variants, while
+/// failures reported by a Windows API carry the Win32 error code in
+/// [`Error::Windows`]. [`Error::win32_code`] maps any variant to a Win32 error
+/// code, and the [`From`] conversion to [`std::io::Error`] does the same for
+/// I/O-based error handling.
+///
+/// This type is owned by `safe-sid`, so it remains stable independently of the
+/// version of `windows-core` used by an application. String parsing reports
+/// [`SidParseError`] instead, which converts into this type via [`From`].
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[non_exhaustive]
+pub enum Error {
+    /// More than 15 sub-authorities were supplied.
+    TooManySubAuthorities,
+    /// An integer identifier authority does not fit in 48 bits.
+    AuthorityOutOfRange,
+    /// The bytes, string, or pointer do not describe a valid SID.
+    InvalidSid,
+    /// A Windows API call failed with this Win32 error code.
+    Windows(u32),
 }
+
+impl Error {
+    /// Returns the Win32 error code equivalent of this error.
+    ///
+    /// Failures detected by this crate map to `ERROR_INVALID_SID`. Failures
+    /// reported by Windows return their original code.
+    #[must_use]
+    pub const fn win32_code(&self) -> u32 {
+        match self {
+            Error::TooManySubAuthorities | Error::AuthorityOutOfRange | Error::InvalidSid => {
+                ERROR_INVALID_SID
+            }
+            Error::Windows(code) => *code,
+        }
+    }
+
+    /// Captures the calling thread's last Win32 error code.
+    fn from_last_win32_error() -> Self {
+        // SAFETY: GetLastError has no preconditions.
+        Error::Windows(unsafe { bindings::GetLastError() })
+    }
+}
+
+impl std::error::Error for Error {}
+
+impl Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Error::TooManySubAuthorities => write!(f, "a SID holds at most 15 sub-authorities"),
+            Error::AuthorityOutOfRange => {
+                write!(f, "the identifier authority does not fit in 48 bits")
+            }
+            Error::InvalidSid => write!(f, "not a valid SID"),
+            Error::Windows(code) => {
+                Display::fmt(&std::io::Error::from_raw_os_error(*code as i32), f)
+            }
+        }
+    }
+}
+
+impl From<Error> for std::io::Error {
+    fn from(error: Error) -> Self {
+        std::io::Error::from_raw_os_error(error.win32_code() as i32)
+    }
+}
+
+/// A result returned by fallible `safe-sid` operations.
+pub type Result<T> = std::result::Result<T, Error>;
 
 /// Converts a supported pointer wrapper to the raw pointer used by SID APIs.
 ///
 /// This trait lets [`Sid::from_psid`] and [`SidBuf::from_psid`] work with raw
-/// `c_void` pointers. With the `windows-full` feature they also accept
-/// [`windows::Win32::Security::PSID`](https://microsoft.github.io/windows-docs-rs/doc/windows/Win32/Security/struct.PSID.html).
+/// `c_void` pointers and user-defined pointer wrappers without depending on a
+/// particular Windows bindings crate.
 pub trait AsSidPtr {
     /// Returns the wrapped SID pointer.
     fn as_sid_ptr(&self) -> *const c_void;
@@ -153,31 +207,16 @@ pub trait AsSidPtr {
 
 /// Converts a well-known SID type to the value expected by Windows.
 ///
-/// The crate's constants, such as [`WinLocalSystemSid`], implement this trait.
-/// With the `windows-full` feature, the equivalent constants from the
-/// `windows` crate do as well.
+/// The crate's constants, such as [`well_known::WinLocalSystemSid`], implement
+/// this trait.
 pub trait AsWellKnownSidType {
-    /// Returns the numeric `WELL_KNOWN_SID_TYPE` value.
-    fn as_well_known_sid_type(&self) -> WELL_KNOWN_SID_TYPE;
+    /// Returns the wrapped well-known SID type.
+    fn as_well_known_sid_type(&self) -> WellKnownSidType;
 }
 
-impl AsWellKnownSidType for WELL_KNOWN_SID_TYPE {
-    fn as_well_known_sid_type(&self) -> WELL_KNOWN_SID_TYPE {
+impl AsWellKnownSidType for WellKnownSidType {
+    fn as_well_known_sid_type(&self) -> WellKnownSidType {
         *self
-    }
-}
-
-#[cfg(feature = "windows-full")]
-impl AsWellKnownSidType for WINDOWS_WELL_KNOWN_SID_TYPE {
-    fn as_well_known_sid_type(&self) -> WELL_KNOWN_SID_TYPE {
-        self.0
-    }
-}
-
-#[cfg(feature = "windows-full")]
-impl AsSidPtr for PSID {
-    fn as_sid_ptr(&self) -> *const c_void {
-        self.0
     }
 }
 
@@ -192,6 +231,62 @@ impl AsSidPtr for *mut c_void {
         *self
     }
 }
+
+mod sealed {
+    /// Prevents implementations of [`IntoAuthority`](super::IntoAuthority)
+    /// outside of this crate.
+    pub trait Sealed {}
+}
+
+/// Converts a value into a SID's six-byte identifier authority.
+///
+/// This trait is implemented for `[u8; 6]`, the authority's raw big-endian
+/// form used by the constants in [`authority`], and for every primitive
+/// integer type. Integer values must fit in 48 bits.
+///
+/// The trait is sealed and cannot be implemented outside of `safe-sid`.
+pub trait IntoAuthority: sealed::Sealed {
+    /// Returns the value as a big-endian six-byte identifier authority.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::AuthorityOutOfRange`] if the value cannot be
+    /// represented in 48 bits.
+    fn try_into_authority(self) -> Result<[u8; 6]>;
+}
+
+impl sealed::Sealed for [u8; 6] {}
+
+impl IntoAuthority for [u8; 6] {
+    fn try_into_authority(self) -> Result<[u8; 6]> {
+        Ok(self)
+    }
+}
+
+macro_rules! impl_into_authority {
+    ($($t:ty)*) => {$(
+        impl sealed::Sealed for $t {}
+
+        impl IntoAuthority for $t {
+            #[allow(clippy::useless_conversion)] // the u64 expansion converts u64 to u64
+            fn try_into_authority(self) -> Result<[u8; 6]> {
+                match u64::try_from(self) {
+                    Ok(value) if value <= MAX_AUTHORITY => {
+                        Ok(value.to_be_bytes()[2..].try_into().unwrap())
+                    }
+                    _ => Err(Error::AuthorityOutOfRange),
+                }
+            }
+        }
+    )*};
+}
+
+// i32 is required in this list: with multiple integer impls, an unsuffixed
+// literal in `SidBuf::new(5, ...)` resolves through the compiler's i32
+// fallback, so removing i32 breaks such calls. The list deliberately covers
+// every primitive integer type so it never needs to grow, which keeps that
+// fallback (and therefore inference) stable.
+impl_into_authority!(u8 u16 u32 u64 u128 usize i8 i16 i32 i64 i128 isize);
 
 /// A borrowed SID.
 ///
@@ -236,8 +331,7 @@ impl Sid {
         unsafe { &mut *ptr }
     }
 
-    /// The number of sub-authorities, limited by the capacity of the actual buffer so we
-    /// can prevent out-of-bounds reads.
+    /// Returns the number of sub-authorities that fit in the backing buffer.
     #[inline]
     fn logical_sub_count(&self) -> usize {
         (self.sub_authority_count as usize).min(self.sub_authority.len())
@@ -248,8 +342,8 @@ impl Sid {
     #[inline]
     fn words(&self) -> &[u32] {
         // SAFETY: logical_sub_count() is limited to our actual buffer size, so
-        // even if  sub_authority_count is oversized, it won't return a buffer
-        // that can allow out-of-bounds reads
+        // even if sub_authority_count is oversized, the returned slice cannot
+        // allow out-of-bounds reads.
         unsafe {
             std::slice::from_raw_parts(
                 self as *const Sid as *const u32,
@@ -264,6 +358,7 @@ impl Sid {
     /// sub-authority. Spare capacity in a [`SidBuf::with_capacity`] allocation
     /// is not included.
     #[inline]
+    #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
         let words = self.words();
         // SAFETY: [u32] has a stronger alignment requirement than [u8], size is computed accurately
@@ -282,41 +377,26 @@ impl Sid {
         }
     }
 
-    /// Returns a `PSID` pointing at this SID for use with Windows APIs.
-    ///
-    /// # Safety
-    ///
-    /// The returned pointer is borrowed from `self` and must not outlive it.
-    /// Although `PSID` contains a mutable pointer, the pointee must not be
-    /// mutated through this shared reference.
-    #[cfg(feature = "windows-full")]
-    #[inline]
-    pub unsafe fn as_psid(&self) -> PSID {
-        PSID(self as *const Sid as *mut _)
-    }
-
     /// Returns a raw pointer to this SID for use with Windows APIs.
     ///
     /// The pointer remains valid only while `self` is alive and has not been
     /// mutably borrowed. The called API must not mutate the SID through it.
+    #[must_use]
     pub fn as_ptr(&self) -> *const c_void {
         self as *const Sid as *const c_void
     }
 
-    /// Borrow a raw `PSID` as `&'a Sid`, validating its structure.
-    ///
-    /// Returns `ERROR_INVALID_SID` if `psid` is not a valid SID.
+    /// Borrows a raw `PSID` as `&'a Sid`, validating its structure.
     ///
     /// # Safety
     ///
-    /// `psid` must point to a readable SID that stays valid for `'a`. It must also be 4-byte
-    /// aligned since the words are borrowed as `&[u32]`. The sub-authority count must be accurate
-    /// to prevent out-of-bounds reads. Every SID Windows hands out is already aligned with a correct
-    /// count.
+    /// `psid` must be non-null and point to a readable, 4-byte-aligned SID that
+    /// remains valid for `'a`. Its sub-authority count must accurately describe
+    /// the allocation. SIDs allocated by Windows meet these requirements.
     ///
     /// # Errors
     ///
-    /// Returns `ERROR_INVALID_SID` if the revision or sub-authority count is
+    /// Returns [`Error::InvalidSid`] if the revision or sub-authority count is
     /// outside the range allowed by Windows.
     pub unsafe fn from_psid<'a>(psid: impl AsSidPtr) -> Result<&'a Sid> {
         let psid = psid.as_sid_ptr();
@@ -325,7 +405,7 @@ impl Sid {
         let p = psid as *const u8;
         let (revision, sub_count) = unsafe { (*p, *p.add(1)) };
         if revision != SID_REVISION || sub_count > SID_MAX_SUB_AUTHORITIES {
-            return Err(invalid_sid_err());
+            return Err(Error::InvalidSid);
         }
 
         // Validate 4-byte alignment in debug mode
@@ -346,31 +426,56 @@ impl Sid {
     ///
     /// Valid Windows SIDs currently have revision 1.
     #[inline]
+    #[must_use]
     pub fn revision(&self) -> u8 {
         self.revision
     }
 
     /// Returns the number of sub-authorities recorded in the SID header.
     #[inline]
+    #[must_use]
     pub fn sub_authority_count(&self) -> u8 {
         self.sub_authority_count
     }
 
     /// Returns the 48-bit identifier authority as an integer.
     #[inline]
+    #[must_use]
     pub fn authority(&self) -> u64 {
         let [a0, a1, a2, a3, a4, a5] = self.identifier_authority;
         u64::from_be_bytes([0, 0, a0, a1, a2, a3, a4, a5])
     }
 
+    /// Returns the identifier authority in its big-endian six-byte form.
+    ///
+    /// This is the representation used by the constants in [`authority`] and
+    /// accepted by [`SidBuf::new`].
+    #[inline]
+    #[must_use]
+    pub fn authority_bytes(&self) -> [u8; 6] {
+        self.identifier_authority
+    }
+
     /// Returns the sub-authority at `idx`, or `None` if it is out of bounds.
     #[inline]
+    #[must_use]
     pub fn sub_authority(&self, idx: u8) -> Option<u32> {
         self.sub_authorities().get(idx as usize).copied()
     }
 
+    /// Returns the SID's relative identifier (RID).
+    ///
+    /// A RID is the final sub-authority. Returns `None` when the SID has no
+    /// sub-authorities.
+    #[inline]
+    #[must_use]
+    pub fn rid(&self) -> Option<u32> {
+        self.sub_authorities().last().copied()
+    }
+
     /// Returns all of the SID's sub-authorities.
     #[inline]
+    #[must_use]
     pub fn sub_authorities(&self) -> &[u32] {
         &self.sub_authority[..self.logical_sub_count()]
     }
@@ -380,6 +485,7 @@ impl Sid {
     /// A SID prefix contains the revision, identifier authority, sub-authority
     /// count, and every sub-authority except the last.
     #[inline]
+    #[must_use]
     pub fn equal_prefix(&self, other: &Sid) -> bool {
         self.revision == other.revision
             && self.identifier_authority == other.identifier_authority
@@ -394,7 +500,8 @@ impl Sid {
             }
     }
 
-    /// Determines whether this SID and `other` belong to the same Windows account domain.
+    /// Tests whether this SID and `other` belong to the same Windows account
+    /// domain.
     ///
     /// Calls the Windows `EqualDomainSid` function.
     ///
@@ -415,7 +522,7 @@ impl Sid {
             )
         } == 0
         {
-            return Err(Error::from_thread());
+            return Err(Error::from_last_win32_error());
         }
         Ok(equal != 0)
     }
@@ -437,8 +544,8 @@ impl Sid {
                 &mut len,
             ) == 0
             {
-                let error = Error::from_thread();
-                if error.code() != HRESULT::from_win32(bindings::ERROR_INSUFFICIENT_BUFFER) {
+                let error = Error::from_last_win32_error();
+                if error.win32_code() != bindings::ERROR_INSUFFICIENT_BUFFER {
                     return Err(error);
                 }
             }
@@ -450,7 +557,7 @@ impl Sid {
                 &mut len,
             ) == 0
             {
-                return Err(Error::from_thread());
+                return Err(Error::from_last_win32_error());
             }
             Ok(domain_sid)
         }
@@ -460,14 +567,11 @@ impl Sid {
     ///
     /// Calls the Windows `IsWellKnownSid` function.
     #[inline]
+    #[must_use]
     pub fn is_well_known(&self, well_known_type: impl AsWellKnownSidType) -> bool {
+        let well_known_type = well_known_type.as_well_known_sid_type();
         // SAFETY: self supplies a valid SID pointer
-        unsafe {
-            bindings::IsWellKnownSid(
-                self.as_ptr().cast_mut(),
-                well_known_type.as_well_known_sid_type(),
-            ) != 0
-        }
+        unsafe { bindings::IsWellKnownSid(self.as_ptr().cast_mut(), well_known_type.0) != 0 }
     }
 }
 
@@ -503,7 +607,9 @@ impl PartialOrd for Sid {
 impl Ord for Sid {
     #[inline]
     fn cmp(&self, other: &Self) -> Ordering {
-        self.as_bytes().cmp(other.as_bytes())
+        self.authority()
+            .cmp(&other.authority())
+            .then_with(|| self.sub_authorities().cmp(other.sub_authorities()))
     }
 }
 
@@ -537,19 +643,6 @@ impl Debug for Sid {
 /// `SidBuf` dereferences to [`Sid`], so all borrowed-SID operations are
 /// available directly on an owned value. Clone a `SidBuf` to duplicate its
 /// bytes, or borrow it as `&Sid` without allocating.
-///
-/// # Examples
-///
-/// ```
-/// use safe_sid::{Sid, SidBuf};
-///
-/// let owned: SidBuf = "S-1-5-18".parse()?;
-/// let borrowed: &Sid = &owned;
-///
-/// assert_eq!(borrowed.to_string(), "S-1-5-18");
-/// assert_eq!(borrowed.to_owned(), owned);
-/// # Ok::<(), safe_sid::ParseError>(())
-/// ```
 pub struct SidBuf {
     sid: Box<Sid>,
 }
@@ -560,57 +653,147 @@ impl Clone for SidBuf {
     }
 }
 
-#[derive(Debug)]
-/// The error returned when a string is not a valid numeric SID.
+/// The error returned when a string is not a valid SID.
 ///
-/// See [`SidBuf::from_str`](FromStr::from_str) for the accepted format.
-pub struct ParseError;
+/// Both [`SidBuf::from_str`](FromStr::from_str) and
+/// [`SidBuf::from_string_sid`] report this error; see those functions for the
+/// formats they accept. The [`From`] conversion to [`Error`] lets `?`
+/// propagate a parse failure from a function returning [`Result`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SidParseError {
+    kind: SidParseErrorKind,
+}
 
-impl std::error::Error for ParseError {}
-impl Display for ParseError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "invalid SID string")
+/// The private detail behind [`SidParseError`], following the pattern of
+/// [`std::num::ParseIntError`]. Kept private so the cases can be refined
+/// without a breaking change; visible through `Debug` output only.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum SidParseErrorKind {
+    /// The string does not match the SID grammar.
+    Invalid,
+    /// The string contains an interior NUL byte, so it cannot be passed to
+    /// Windows.
+    InteriorNul,
+    /// `ConvertStringSidToSid` rejected the string with this Win32 error code.
+    Windows(u32),
+}
+
+impl SidParseError {
+    fn invalid() -> Self {
+        Self {
+            kind: SidParseErrorKind::Invalid,
+        }
     }
 }
 
-impl FromStr for SidBuf {
-    type Err = ParseError;
+impl std::error::Error for SidParseError {}
 
+impl Display for SidParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.kind {
+            SidParseErrorKind::Invalid => write!(f, "invalid SID string"),
+            SidParseErrorKind::InteriorNul => {
+                write!(f, "SID string contains an interior NUL byte")
+            }
+            SidParseErrorKind::Windows(code) => {
+                write!(
+                    f,
+                    "invalid SID string: {}",
+                    std::io::Error::from_raw_os_error(code as i32)
+                )
+            }
+        }
+    }
+}
+
+impl From<SidParseError> for Error {
+    fn from(_: SidParseError) -> Error {
+        Error::InvalidSid
+    }
+}
+
+/// Parses a numeric SID string such as `S-1-5-32-544`.
+///
+/// The format is `S-1-<authority>` followed by zero to fifteen `-<sub-authority>`
+/// components: the literal `S` (case-insensitive), the revision `1`, an
+/// identifier authority of at most 48 bits in decimal or `0x`/`0X`-prefixed
+/// hexadecimal, and decimal sub-authorities. Parsing is pure Rust and never
+/// calls Windows; use [`SidBuf::from_string_sid`] for Windows-defined
+/// aliases such as `BA`.
+///
+/// Every string produced by the [`Display`] implementation parses back to an
+/// equal SID. The parser also accepts equivalent spellings that [`Display`]
+/// never produces: a lowercase `s`, leading zeros, and hexadecimal
+/// authorities small enough to be displayed in decimal. Signs, whitespace,
+/// empty components, and non-ASCII digits are rejected.
+///
+/// # Examples
+///
+/// ```
+/// use safe_sid::SidBuf;
+///
+/// let sid: SidBuf = "S-1-5-32-544".parse()?;
+/// assert_eq!(sid.authority(), 5);
+/// assert_eq!(sid.sub_authorities(), [32, 544]);
+///
+/// assert!("S-1-5-".parse::<SidBuf>().is_err());
+/// assert!("BA".parse::<SidBuf>().is_err()); // aliases need from_string_sid
+/// # Ok::<(), safe_sid::SidParseError>(())
+/// ```
+impl FromStr for SidBuf {
+    type Err = SidParseError;
+
+    /// Parses a numeric SID string.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SidParseError`] if the string does not match the format
+    /// described [above](#impl-FromStr-for-SidBuf).
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
         let mut parts = s.split('-');
 
         // Leading "S", case-insensitive
         match parts.next() {
             Some(p) if p.eq_ignore_ascii_case("S") => {}
-            _ => return Err(ParseError),
+            _ => return Err(SidParseError::invalid()),
         }
 
         // Revision (only 1 is allowed)
         if parts.next() != Some("1") {
-            return Err(ParseError);
+            return Err(SidParseError::invalid());
         }
 
         // Identifier authority: decimal or 0x-prefixed hex, 48 bits max
-        let authority_str = parts.next().ok_or(ParseError)?;
+        let authority_str = parts.next().ok_or_else(SidParseError::invalid)?;
         let authority = match authority_str
             .strip_prefix("0x")
             .or_else(|| authority_str.strip_prefix("0X"))
         {
-            Some(hex) => u64::from_str_radix(hex, 16).map_err(|_| ParseError)?,
-            None => authority_str.parse::<u64>().map_err(|_| ParseError)?,
+            Some(hex) if !hex.is_empty() && hex.bytes().all(|b| b.is_ascii_hexdigit()) => {
+                u64::from_str_radix(hex, 16).map_err(|_| SidParseError::invalid())?
+            }
+            Some(_) => return Err(SidParseError::invalid()),
+            None if !authority_str.is_empty()
+                && authority_str.bytes().all(|b| b.is_ascii_digit()) =>
+            {
+                authority_str
+                    .parse::<u64>()
+                    .map_err(|_| SidParseError::invalid())?
+            }
+            None => return Err(SidParseError::invalid()),
         };
-        if authority > 0xFFFF_FFFF_FFFF {
-            return Err(ParseError);
-        }
-        let identifier_authority: [u8; 6] = authority.to_be_bytes()[2..].try_into().unwrap();
-
         // Remaining fields are decimal sub-authorities
         let sub_authorities = parts
-            .map(|p| p.parse::<u32>())
-            .collect::<std::result::Result<Vec<u32>, _>>()
-            .map_err(|_| ParseError)?;
+            .map(|p| {
+                if p.is_empty() || !p.bytes().all(|b| b.is_ascii_digit()) {
+                    return Err(SidParseError::invalid());
+                }
+                p.parse::<u32>().map_err(|_| SidParseError::invalid())
+            })
+            .collect::<std::result::Result<Vec<u32>, _>>()?;
 
-        SidBuf::new(identifier_authority, &sub_authorities).map_err(|_| ParseError)
+        // new() rejects authorities over 48 bits and more than 15 sub-authorities
+        SidBuf::new(authority, &sub_authorities).map_err(|_| SidParseError::invalid())
     }
 }
 
@@ -624,9 +807,9 @@ impl SidBuf {
             "a SID has at least the two header words"
         );
         let sub_count = words.len() - SID_HEADER_WORDS;
-        // A DST only tracks the size of the array. Our input box is entirely an array while our
-        // Sid struct has 2 words before the array. When creating a Sid pointer from the u64 slice
-        // we have to account for that by subtracting off the header.
+        // A DST pointer tracks only the trailing slice length. The input box is
+        // entirely an array, while Sid has two header words before its slice,
+        // so the pointer metadata excludes those header words.
         let data = Box::into_raw(words).cast::<u32>();
         let ptr = std::ptr::slice_from_raw_parts_mut(data, sub_count) as *mut Sid;
         // SAFETY: We are reboxing a pointer with the same alignment as the one it was detached from
@@ -637,21 +820,21 @@ impl SidBuf {
 
     /// Builds a SID from its identifier authority and sub-authorities.
     ///
-    /// Returns `ERROR_INVALID_SID` if more than 15 sub-authorities are given.
+    /// The authority may be one of the constants in [`authority`], the raw
+    /// big-endian `[u8; 6]` form, or any primitive integer that fits in
+    /// 48 bits.
     ///
-    /// # Examples
+    /// # Errors
     ///
-    /// ```
-    /// use safe_sid::SidBuf;
+    /// Returns [`Error::TooManySubAuthorities`] if more than 15 sub-authorities
+    /// are given, or [`Error::AuthorityOutOfRange`] if the authority cannot be
+    /// represented in 48 bits.
     ///
-    /// let administrators = SidBuf::new([0, 0, 0, 0, 0, 5], &[32, 544])?;
-    /// assert_eq!(administrators.to_string(), "S-1-5-32-544");
-    /// # Ok::<(), windows_core::Error>(())
-    /// ```
-    pub fn new(identifier_authority: [u8; 6], sub_authorities: &[u32]) -> Result<Self> {
+    pub fn new(identifier_authority: impl IntoAuthority, sub_authorities: &[u32]) -> Result<Self> {
+        let identifier_authority = identifier_authority.try_into_authority()?;
         let count = sub_authorities.len();
         if count > SID_MAX_SUB_AUTHORITIES as usize {
-            return Err(invalid_sid_err());
+            return Err(Error::TooManySubAuthorities);
         }
 
         let mut words = vec![0u32; SID_HEADER_WORDS + count].into_boxed_slice();
@@ -664,6 +847,54 @@ impl SidBuf {
         Ok(Self::from_boxed_words(words))
     }
 
+    /// Copies a SID from its raw byte representation.
+    ///
+    /// The input does not need to be aligned. Its length must exactly match the
+    /// sub-authority count recorded in the SID header; trailing capacity is not
+    /// accepted.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidSid`] if the input is too short, has an
+    /// unsupported revision or sub-authority count, or does not have the exact
+    /// length required by its header.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use safe_sid::SidBuf;
+    ///
+    /// let bytes = [
+    ///     1, 2, 0, 0, 0, 0, 0, 5, // revision, count, NT authority
+    ///     32, 0, 0, 0,             // BUILTIN
+    ///     32, 2, 0, 0,             // Administrators
+    /// ];
+    /// let administrators = SidBuf::from_bytes(&bytes)?;
+    /// assert_eq!(administrators.to_string(), "S-1-5-32-544");
+    /// # Ok::<(), safe_sid::Error>(())
+    /// ```
+    pub fn from_bytes(bytes: &[u8]) -> Result<SidBuf> {
+        let header_len = SID_HEADER_WORDS * size_of::<u32>();
+        if bytes.len() < header_len || bytes[0] != SID_REVISION {
+            return Err(Error::InvalidSid);
+        }
+
+        let count = bytes[1] as usize;
+        if count > SID_MAX_SUB_AUTHORITIES as usize
+            || bytes.len() != header_len + count * size_of::<u32>()
+        {
+            return Err(Error::InvalidSid);
+        }
+
+        let identifier_authority: [u8; 6] = bytes[2..header_len].try_into().unwrap();
+        let sub_authorities = bytes[header_len..]
+            .chunks_exact(size_of::<u32>())
+            .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
+            .collect::<Vec<_>>();
+
+        SidBuf::new(identifier_authority, &sub_authorities)
+    }
+
     /// Allocates a `SidBuf` of `len` bytes for a Windows API to fill.
     ///
     /// The buffer initially contains the null SID (`S-1-0-0`). `len` is the
@@ -672,6 +903,7 @@ impl SidBuf {
     ///
     /// Extra capacity is not exposed by [`Sid::as_bytes`]; the logical length is
     /// determined by [`Sid::sub_authority_count`].
+    #[must_use]
     pub fn with_capacity(len: usize) -> SidBuf {
         let word_len = len.div_ceil(size_of::<u32>()).max(SID_HEADER_WORDS + 1);
 
@@ -683,8 +915,7 @@ impl SidBuf {
         SidBuf::from_boxed_words(words)
     }
 
-    /// Returns a mutable pointer to this SID's bytes, for passing to a Windows API that
-    /// fills a caller-supplied buffer.
+    /// Returns a mutable pointer to this SID's bytes for a Windows API to fill.
     ///
     /// This is intended for the second call of Windows APIs that first report a
     /// required buffer length. Allocate that length with
@@ -692,11 +923,11 @@ impl SidBuf {
     ///
     /// # Safety
     ///
-    /// Writing through the pointer can leave the buffer holding bytes that are not
-    /// a valid SID. The caller must not write past the length supplied to
-    /// [`SidBuf::with_capacity`] and must leave a valid SID behind before the
-    /// buffer is read through `&Sid`. Dropping the buffer remains safe even if
-    /// the API fails or writes malformed data.
+    /// Writing through the pointer can leave the buffer holding bytes that are
+    /// not a valid SID. The caller must not write past the length supplied to
+    /// [`SidBuf::with_capacity`] and must leave a valid SID behind before
+    /// accessing the buffer through `&Sid`. Dropping the buffer remains safe
+    /// even if the API fails or writes malformed data.
     ///
     /// # Examples
     ///
@@ -705,12 +936,10 @@ impl SidBuf {
     /// the allocated SID and domain-name buffers.
     ///
     /// ```no_run
-    /// # #[cfg(feature = "windows-full")]
-    /// # {
     /// use safe_sid::SidBuf;
     /// use std::ffi::CStr;
     /// use windows::Win32::Security::{LookupAccountNameA, PSID, SID_NAME_USE};
-    /// use windows_core::{HRESULT, PCSTR, PSTR, Result};
+    /// use windows::core::{HRESULT, PCSTR, PSTR, Result};
     ///
     /// fn lookup_account_name(name: &CStr) -> Result<SidBuf> {
     ///     let mut sid_use = SID_NAME_USE::default();
@@ -747,8 +976,8 @@ impl SidBuf {
     /// }
     ///
     /// # let _ = lookup_account_name;
-    /// # }
     /// ```
+    #[must_use]
     pub unsafe fn as_mut_ptr(&mut self) -> *mut c_void {
         let sid: &mut Sid = &mut self.sid;
         sid as *mut Sid as *mut c_void
@@ -763,15 +992,6 @@ impl SidBuf {
     ///
     /// Returns the error reported by `CreateWellKnownSid`.
     ///
-    /// # Examples
-    ///
-    /// ```
-    /// use safe_sid::{SidBuf, WinLocalSystemSid};
-    ///
-    /// let local_system = SidBuf::well_known(WinLocalSystemSid, None)?;
-    /// assert_eq!(local_system.to_string(), "S-1-5-18");
-    /// # Ok::<(), windows_core::Error>(())
-    /// ```
     pub fn well_known(
         well_known_type: impl AsWellKnownSidType,
         domain_sid: Option<&Sid>,
@@ -783,60 +1003,63 @@ impl SidBuf {
                 .unwrap_or(std::ptr::null_mut());
             let mut len = 0u32;
             if bindings::CreateWellKnownSid(
-                well_known_type,
+                well_known_type.0,
                 domain_psid,
                 std::ptr::null_mut(),
                 &mut len,
             ) == 0
             {
-                let error = Error::from_thread();
-                if error.code() != HRESULT::from_win32(bindings::ERROR_INSUFFICIENT_BUFFER) {
+                let error = Error::from_last_win32_error();
+                if error.win32_code() != bindings::ERROR_INSUFFICIENT_BUFFER {
                     return Err(error);
                 }
             }
 
-            let word_len = (len as usize).div_ceil(size_of::<u32>());
+            let word_len = (len as usize)
+                .div_ceil(size_of::<u32>())
+                .max(SID_HEADER_WORDS);
             let mut words: Box<[u32]> = vec![0u32; word_len].into_boxed_slice();
             if bindings::CreateWellKnownSid(
-                well_known_type,
+                well_known_type.0,
                 domain_psid,
                 words.as_mut_ptr().cast(),
                 &mut len,
             ) == 0
             {
-                return Err(Error::from_thread());
+                return Err(Error::from_last_win32_error());
             }
 
             Ok(SidBuf::from_boxed_words(words))
         }
     }
 
-    /// Converts a C string to a SID with `ConvertStringSidToSidA`.
+    /// Converts a string SID to a SID with `ConvertStringSidToSidA`.
     ///
     /// Unlike [`FromStr`], this accepts string constants such as `BA` and `AU`
     /// in addition to numeric SIDs. Windows performs the parsing and may clamp
     /// overflowing numeric components instead of rejecting them.
     ///
+    /// String SIDs and their constants are ASCII. This method converts the
+    /// input to a C string before passing it to the ANSI Windows API.
+    ///
     /// # Errors
     ///
-    /// Returns the error reported by `ConvertStringSidToSidA`.
+    /// Returns [`SidParseError`] if `s` contains an interior NUL byte or is
+    /// rejected by `ConvertStringSidToSidA`.
     ///
-    /// # Examples
-    ///
-    /// ```
-    /// use safe_sid::SidBuf;
-    ///
-    /// let administrators = SidBuf::from_cstr_with_alias(c"BA")?;
-    /// assert_eq!(administrators.to_string(), "S-1-5-32-544");
-    /// # Ok::<(), windows_core::Error>(())
-    /// ```
-    pub fn from_cstr_with_alias(s: &std::ffi::CStr) -> Result<SidBuf> {
+    pub fn from_string_sid(s: &str) -> std::result::Result<SidBuf, SidParseError> {
+        let s = std::ffi::CString::new(s).map_err(|_| SidParseError {
+            kind: SidParseErrorKind::InteriorNul,
+        })?;
+
         unsafe {
             let mut sid = std::ptr::null_mut();
             if bindings::ConvertStringSidToSidA(s.as_ptr().cast(), &mut sid) == 0 {
-                return Err(Error::from_thread());
+                return Err(SidParseError {
+                    kind: SidParseErrorKind::Windows(bindings::GetLastError()),
+                });
             }
-            let res = SidBuf::from_psid(sid);
+            let res = SidBuf::from_psid(sid).map_err(|_| SidParseError::invalid());
             bindings::LocalFree(sid);
             res
         }
@@ -844,29 +1067,19 @@ impl SidBuf {
 
     /// Validates and copies the SID pointed to by `psid` into an owned buffer.
     ///
-    /// Returns `ERROR_INVALID_SID` if the pointer does not reference a valid SID.
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidSid`] if the pointer does not reference a valid
+    /// SID.
     ///
     /// # Safety
     ///
-    /// `psid` must point to a 4-byte-aligned SID structure valid for the duration of this
-    /// call. The data is copied so there is no lifetime requirement for `psid` after this returns.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use safe_sid::{Sid, SidBuf};
-    ///
-    /// let source: SidBuf = "S-1-5-18".parse().unwrap();
-    ///
-    /// let borrowed: &Sid = unsafe { Sid::from_psid(source.as_ptr())? };
-    /// let copied = unsafe { SidBuf::from_psid(source.as_ptr())? };
-    ///
-    /// assert_eq!(borrowed, &*source);
-    /// assert_eq!(copied, source);
-    /// # Ok::<(), windows_core::Error>(())
-    /// ```
+    /// `psid` must be non-null and point to a readable, 4-byte-aligned SID for
+    /// the duration of this call. Its sub-authority count must accurately
+    /// describe the allocation. The data is copied, so the pointer need not
+    /// remain valid after this function returns.
     pub unsafe fn from_psid(psid: impl AsSidPtr) -> Result<Self> {
-        // SAFETY: safety requirements noted to called in the doc comment
+        // SAFETY: safety requirements noted to the caller in the doc comment
         let src = unsafe { Sid::from_psid(psid) }?;
         Ok(src.to_owned())
     }
@@ -937,7 +1150,7 @@ impl Debug for SidBuf {
 
 impl Default for SidBuf {
     fn default() -> Self {
-        SidBuf::new([0, 0, 0, 0, 0, 0], &[0]).unwrap()
+        SidBuf::new(authority::SECURITY_NULL_SID_AUTHORITY, &[0]).unwrap()
     }
 }
 
@@ -955,14 +1168,28 @@ impl PartialEq<Sid> for SidBuf {
     }
 }
 
+impl PartialEq<&Sid> for SidBuf {
+    #[inline]
+    fn eq(&self, other: &&Sid) -> bool {
+        &**self == *other
+    }
+}
+
+impl PartialEq<SidBuf> for &Sid {
+    #[inline]
+    fn eq(&self, other: &SidBuf) -> bool {
+        *self == &**other
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::authority::*;
+    use super::well_known::*;
     use super::*;
 
-    const NT_AUTHORITY: [u8; 6] = [0, 0, 0, 0, 0, 5];
-
     fn nt_sid(sub_authorities: &[u32]) -> SidBuf {
-        SidBuf::new(NT_AUTHORITY, sub_authorities).unwrap()
+        SidBuf::new(SECURITY_NT_AUTHORITY, sub_authorities).unwrap()
     }
 
     #[test]
@@ -982,7 +1209,131 @@ mod tests {
             SidBuf::new([0; 6], &[7; 15]).unwrap().sub_authority_count(),
             15
         );
-        assert!(SidBuf::new([0; 6], &[0; 16]).is_err());
+        assert_eq!(
+            SidBuf::new([0; 6], &[0; 16]).unwrap_err(),
+            Error::TooManySubAuthorities
+        );
+    }
+
+    #[test]
+    fn from_bytes_copies_aligned_and_unaligned_sids() {
+        let expected = nt_sid(&[32, 544]);
+        let bytes = expected.as_bytes();
+
+        assert_eq!(SidBuf::from_bytes(bytes).unwrap(), expected);
+
+        let mut unaligned = vec![0xFF];
+        unaligned.extend_from_slice(bytes);
+        assert_eq!(SidBuf::from_bytes(&unaligned[1..]).unwrap(), expected);
+    }
+
+    #[test]
+    fn from_bytes_validates_the_complete_structure() {
+        let no_sub_authorities = [SID_REVISION, 0, 0, 0, 0, 0, 0, 5];
+        assert_eq!(
+            SidBuf::from_bytes(&no_sub_authorities)
+                .unwrap()
+                .sub_authorities(),
+            &[]
+        );
+
+        let mut too_many_sub_authorities =
+            vec![0; SID_HEADER_WORDS * size_of::<u32>() + 16 * size_of::<u32>()];
+        too_many_sub_authorities[0] = SID_REVISION;
+        too_many_sub_authorities[1] = SID_MAX_SUB_AUTHORITIES + 1;
+
+        for bytes in [
+            &[][..],
+            &[0, 0, 0, 0, 0, 0, 0, 0],
+            &[SID_REVISION, 1, 0, 0, 0, 0, 0, 5],
+            &[SID_REVISION, 0, 0, 0, 0, 0, 0, 5, 0, 0, 0, 0],
+            &too_many_sub_authorities,
+        ] {
+            assert_eq!(SidBuf::from_bytes(bytes).unwrap_err(), Error::InvalidSid);
+        }
+    }
+
+    #[test]
+    fn rid_returns_the_final_sub_authority() {
+        assert_eq!(nt_sid(&[21, 1, 2, 3, 1000]).rid(), Some(1000));
+        assert_eq!(SidBuf::new(5, &[]).unwrap().rid(), None);
+    }
+
+    #[test]
+    fn new_accepts_every_authority_form() {
+        let from_const = SidBuf::new(SECURITY_NT_AUTHORITY, &[18]).unwrap();
+        // Each of these forms must keep compiling: the unsuffixed literal
+        // resolves through the i32 fallback and the unsuffixed array through
+        // the sole [u8; 6] impl
+        let from_array = SidBuf::new([0, 0, 0, 0, 0, 5], &[18]).unwrap();
+        let from_literal = SidBuf::new(5, &[18]).unwrap();
+        let from_u8 = SidBuf::new(5u8, &[18]).unwrap();
+        let from_u64 = SidBuf::new(5u64, &[18]).unwrap();
+        let from_usize = SidBuf::new(5usize, &[18]).unwrap();
+        let from_i128 = SidBuf::new(5i128, &[18]).unwrap();
+
+        for sid in [
+            from_array,
+            from_literal,
+            from_u8,
+            from_u64,
+            from_usize,
+            from_i128,
+        ] {
+            assert_eq!(sid, from_const);
+        }
+    }
+
+    #[test]
+    fn new_enforces_the_authority_range() {
+        assert_eq!(
+            SidBuf::new(MAX_AUTHORITY, &[]).unwrap().authority(),
+            MAX_AUTHORITY
+        );
+
+        for result in [
+            SidBuf::new(-1, &[]),
+            SidBuf::new(1u64 << 48, &[]),
+            SidBuf::new(u128::MAX, &[]),
+            SidBuf::new(i64::MIN, &[]),
+        ] {
+            assert_eq!(result.unwrap_err(), Error::AuthorityOutOfRange);
+        }
+    }
+
+    #[test]
+    fn authority_getters_round_trip_through_new() {
+        let sid = nt_sid(&[32, 544]);
+        assert_eq!(sid.authority(), 5);
+        assert_eq!(sid.authority_bytes(), SECURITY_NT_AUTHORITY);
+        assert_eq!(
+            SidBuf::new(sid.authority(), sid.sub_authorities()).unwrap(),
+            sid
+        );
+
+        let large = SidBuf::new(1u64 << 32, &[1]).unwrap();
+        assert_eq!(large.authority_bytes(), [0, 1, 0, 0, 0, 0]);
+        assert_eq!(
+            SidBuf::new(large.authority_bytes(), large.sub_authorities()).unwrap(),
+            large
+        );
+    }
+
+    #[test]
+    fn errors_map_to_win32_codes() {
+        assert_eq!(Error::TooManySubAuthorities.win32_code(), ERROR_INVALID_SID);
+        assert_eq!(Error::AuthorityOutOfRange.win32_code(), ERROR_INVALID_SID);
+        assert_eq!(Error::InvalidSid.win32_code(), ERROR_INVALID_SID);
+        assert_eq!(Error::Windows(5).win32_code(), 5);
+
+        let io_error: std::io::Error = Error::Windows(5).into();
+        assert_eq!(io_error.raw_os_error(), Some(5));
+
+        assert_eq!(Error::from(SidParseError::invalid()), Error::InvalidSid);
+
+        for error in [Error::TooManySubAuthorities, Error::Windows(5)] {
+            assert!(!error.to_string().is_empty());
+        }
     }
 
     #[test]
@@ -1035,25 +1386,6 @@ mod tests {
         };
 
         assert_eq!(copied.to_string(), "S-1-5-18");
-    }
-
-    #[cfg(feature = "windows-full")]
-    #[test]
-    fn windows_psid_interoperates_when_enabled() {
-        let source = nt_sid(&[18]);
-        let psid = unsafe { source.as_psid() };
-
-        assert_eq!(unsafe { Sid::from_psid(psid) }.unwrap(), &*source);
-    }
-
-    #[cfg(feature = "windows-full")]
-    #[test]
-    fn windows_well_known_sid_types_interoperate_when_enabled() {
-        use windows::Win32::Security::WinLocalSystemSid as WindowsWinLocalSystemSid;
-
-        let local_system = SidBuf::well_known(WindowsWinLocalSystemSid, None).unwrap();
-
-        assert!(local_system.is_well_known(WindowsWinLocalSystemSid));
     }
 
     #[test]
@@ -1112,6 +1444,12 @@ mod tests {
         assert_eq!(via_deref.to_owned(), owned);
         assert_eq!(*via_deref, owned);
         assert_eq!(owned, *via_deref);
+        assert_eq!(via_deref, owned);
+        assert_eq!(owned, via_deref);
+
+        let different = nt_sid(&[19]);
+        assert_ne!(via_deref, different);
+        assert_ne!(different, via_deref);
     }
 
     #[test]
@@ -1171,6 +1509,9 @@ mod tests {
             "S-2-5-18",                                     // unsupported revision
             "S-1",                                          // missing authority
             "S-1-5-",                                       // trailing separator
+            "S-1-+5-18",                                    // signed decimal authority
+            "S-1-0x+5-18",                                  // signed hexadecimal authority
+            "S-1-5-+18",                                    // signed sub-authority
             "S-1-5-4294967296",                             // sub-authority overflows u32
             "S-1-0x1000000000000-1",                        // authority overflows 48 bits
             "S-1-5-1-2-3-4-5-6-7-8-9-10-11-12-13-14-15-16", // more than 15 sub-authorities
@@ -1180,7 +1521,7 @@ mod tests {
     }
 
     #[test]
-    fn equality_and_ordering_follow_sid_bytes() {
+    fn equality_and_ordering_follow_sid_fields_numerically() {
         let a = nt_sid(&[18]);
         let b = nt_sid(&[18]);
         let c = nt_sid(&[19]);
@@ -1188,6 +1529,12 @@ mod tests {
         assert_ne!(a, c);
 
         assert!(a < nt_sid(&[32, 544]));
+        assert!(nt_sid(&[1]) < nt_sid(&[256]));
+        assert!(nt_sid(&[21, 1]) < nt_sid(&[21, 1, 1]));
+
+        let lower_authority = SidBuf::new(4, &[u32::MAX, u32::MAX]).unwrap();
+        let higher_authority = SidBuf::new(5, &[0]).unwrap();
+        assert!(lower_authority < higher_authority);
     }
 
     #[test]
@@ -1203,7 +1550,7 @@ mod tests {
         assert!(!first.equal_prefix(&different_count));
         assert!(!first.equal_prefix(&different_authority));
 
-        let no_sub_authorities = SidBuf::new(NT_AUTHORITY, &[]).unwrap();
+        let no_sub_authorities = SidBuf::new(SECURITY_NT_AUTHORITY, &[]).unwrap();
         assert!(no_sub_authorities.equal_prefix(&no_sub_authorities));
     }
 
@@ -1239,15 +1586,22 @@ mod tests {
     }
 
     #[test]
-    fn from_cstr_supports_numeric_and_aliases() {
+    fn from_string_sid_supports_numeric_and_aliases() {
         let ba = nt_sid(&[32, 544]);
-        assert_eq!(SidBuf::from_cstr_with_alias(c"BA").unwrap(), ba);
-        assert_eq!(SidBuf::from_cstr_with_alias(c"S-1-5-32-544").unwrap(), ba);
+        assert_eq!(SidBuf::from_string_sid("BA").unwrap(), ba);
+        assert_eq!(SidBuf::from_string_sid("S-1-5-32-544").unwrap(), ba);
     }
 
     #[test]
-    fn from_cstr_fails_on_bad_input() {
-        assert!(SidBuf::from_cstr_with_alias(c"").is_err());
-        assert!(SidBuf::from_cstr_with_alias(c"not-a-sid").is_err());
+    fn from_string_sid_fails_on_bad_input() {
+        assert!(matches!(
+            SidBuf::from_string_sid("").unwrap_err().kind,
+            SidParseErrorKind::Windows(_)
+        ));
+        assert!(SidBuf::from_string_sid("not-a-sid").is_err());
+        assert!(matches!(
+            SidBuf::from_string_sid("BA\0").unwrap_err().kind,
+            SidParseErrorKind::InteriorNul
+        ));
     }
 }

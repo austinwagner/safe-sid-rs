@@ -1,90 +1,59 @@
 # safe-sid
 
-Safe wrapper for working with SIDs from the Windows API.
+Safe borrowed and owned wrappers for Windows security identifiers (SIDs).
 
-Provides the borrowed/owned pair `&Sid` and `SidBuf` along with safe helper functions. Byte-compatible with the Windows `SID` struct. Defines equality and ordering traits so they can be compared and keyed on.
+The crate provides the borrowed and owned pair `&Sid` and `SidBuf`. Both use
+the in-memory layout of the Windows `SID` structure and support equality,
+ordering, hashing, and formatting.
 
-Only depends on the `windows-core` and `windows-link` crates by default. If you want to have functions accept and return `windows::Win32::Security::PSID`, enable the `windows-full` feature.
+The crate only depends on `windows-link`. It deliberately uses raw pointers at
+its API boundary so it is not coupled to any version of the `windows` crate.
+It supports Windows targets and requires Rust 1.88 or newer.
 
 ## Usage
 
 ```toml
 [dependencies]
-safe-sid = "0.1"
+safe-sid = "1.0.0"
 ```
-
-To accept and return `windows::Win32::Security::PSID` directly:
-
-```toml
-[dependencies]
-safe-sid = { version = "0.1", features = ["windows-full"] }
-windows = { version = "0.62", features = ["Win32_Security"] }
-```
-
-This allows `from_psid()` to accept the `PSID` type and enables the `as_psid()` function. Without it, you can still pass a raw `*const c_void` to `from_psid()` and get a similar raw pointer via `as_ptr()`.
-
-### Build a SID by hand
 
 ```rust
-let admins = SidBuf::new([0, 0, 0, 0, 0, 5], &[32, 544]).unwrap();
+use safe_sid::SidBuf;
+use safe_sid::authority::SECURITY_NT_AUTHORITY;
+
+let admins = SidBuf::new(SECURITY_NT_AUTHORITY, &[32, 544]).unwrap();
 assert_eq!(admins.to_string(), "S-1-5-32-544");
+
+let parsed: SidBuf = "S-1-5-32-544".parse().unwrap();
+assert_eq!(parsed, admins);
 ```
 
-### Build a well-known SID
+`SidBuf::new` also accepts a plain integer that fits in 48 bits or the raw
+six-byte authority. `SidBuf::well_known` creates Windows well-known SIDs, and
+`SidBuf::from_string_sid` accepts Windows aliases such as `BA`.
 
-```rust
-let local_system = SidBuf::well_known(WinLocalSystemSid, None).unwrap();
-assert_eq!(local_system.to_string(), "S-1-5-18");
+The `Win*Sid` constants in the `well_known` module use the opaque
+`WellKnownSidType` wrapper, so arbitrary integer values cannot be passed to the
+well-known SID APIs.
+
+## Windows API interoperability
+
+Applications using the `windows` crate can construct a `PSID` from
+`Sid::as_ptr()` at the call site without requiring `safe-sid` to track the
+same `windows` version. For APIs that fill a caller-provided buffer, use
+`SidBuf::with_capacity` and `SidBuf::as_mut_ptr`. The
+[`SidBuf::as_mut_ptr` documentation](https://docs.rs/safe-sid/latest/safe_sid/struct.SidBuf.html#method.as_mut_ptr)
+includes the complete two-call pattern and its safety requirements.
+
+## Development
+
+Repository maintenance commands are exposed through `cargo xtask`. Run
+`cargo xtask --help` to list them. To refresh the vendored Windows bindings and
+well-known SID constants:
+
+```text
+cargo xtask regenerate-bindings
 ```
-
-### Pass a SID to a Windows API
-
-```rust
-// Just an example, use Sid::to_string() normally 
-fn sid_to_string(sid: &Sid) -> Result<String> {
-    let mut hlocal_str = PSTR::null();
-    unsafe {
-        ConvertSidToStringSidA(sid.as_psid(), &mut hlocal_str)?;
-        let string_sid = CStr::from_ptr(hlocal_str.0 as *const _).to_str().unwrap().to_owned();
-        LocalFree(Some(HLOCAL(hlocal_str.0 as *mut _)));
-        Ok(string_sid)
-    }
-}
-```
-
-### Fill a `SidBuf` from a Windows API
-
-Sometimes a SID comes from a Windows API that expects the caller to provide a buffer. You can unsafely acquire a mutable pointer, and are responsible for ensuring it is filled with a valid SID with a correctly matching length. 
-
-Note that even if the SID is malformed, dropping `SidBuf` will still be safe.
-
-```rust
-fn lookup_account_name(name: &CStr) -> Result<SidBuf> {
-    let mut sid_use = SID_NAME_USE::default();
-    let mut sid_len = 0u32;
-    let mut domain_len = 0u32;
-
-    unsafe {
-        if let Err(e) = LookupAccountNameA(
-            PCSTR::null(), PCSTR(name.as_ptr() as *const _), None, &mut sid_len,
-            None, &mut domain_len, &mut sid_use,
-        ) && e.code() != HRESULT::from_win32(ERROR_INSUFFICIENT_BUFFER.0)
-        {
-            return Err(e);
-        }
-
-        // Create the SidBuf with enough space to receive the SID
-        let mut sid = SidBuf::with_capacity(sid_len as usize);
-        let mut domain = vec![0u8; domain_len as usize];
-        LookupAccountNameA(
-            PCSTR::null(), PCSTR(name.as_ptr() as *const _), Some(PSID(sid.as_mut_ptr())), &mut sid_len,
-            Some(PSTR(domain.as_mut_ptr())), &mut domain_len, &mut sid_use,
-        )?;
-        Ok(sid)
-    }
-}
-```
-
 
 ## License
 
