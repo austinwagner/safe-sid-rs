@@ -47,7 +47,7 @@
 //! let sid: SidBuf = "S-1-5-18".parse()?;
 //! assert_eq!(sid.authority(), 5);
 //! assert_eq!(sid.sub_authorities(), [18]);
-//! # Ok::<(), safe_sid::ParseError>(())
+//! # Ok::<(), safe_sid::ParseSidError>(())
 //! ```
 //!
 //! [`SidBuf::from_string_sid`] additionally accepts Windows aliases such
@@ -144,36 +144,52 @@ pub struct WellKnownSidType(i32);
 const SID_REVISION: u8 = 1;
 const SID_MAX_SUB_AUTHORITIES: u8 = 15;
 const SID_HEADER_WORDS: usize = 2;
-const ERROR_INVALID_PARAMETER: u32 = 0x0057;
 const ERROR_INVALID_SID: u32 = 0x0539;
 const MAX_AUTHORITY: u64 = 0xFFFF_FFFF_FFFF;
 
 /// An error reported while creating, validating, or querying a SID.
 ///
-/// The contained value is a Win32 error code, available through [`Error::code`].
+/// Failures detected by this crate are reported as descriptive variants, while
+/// failures reported by a Windows API carry the Win32 error code in
+/// [`Error::Windows`]. [`Error::win32_code`] maps any variant to a Win32 error
+/// code,
+/// and the [`From`] conversion to [`std::io::Error`] does the same for
+/// io-based error handling.
+///
 /// This type is owned by `safe-sid`, so it remains stable independently of the
-/// version of `windows-core` used by an application.
+/// version of `windows-core` used by an application. String parsing reports
+/// [`ParseSidError`] instead, which converts into this type via [`From`].
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 #[non_exhaustive]
-pub struct Error {
-    code: u32,
+pub enum Error {
+    /// More than 15 sub-authorities were supplied.
+    TooManySubAuthorities,
+    /// An integer identifier authority does not fit in 48 bits.
+    AuthorityOutOfRange,
+    /// The bytes, string, or pointer do not describe a valid SID.
+    InvalidSid,
+    /// A Windows API call failed with this Win32 error code.
+    Windows(u32),
 }
 
 impl Error {
-    /// Creates an error from a Win32 error code.
-    pub const fn from_win32(code: u32) -> Self {
-        Self { code }
+    /// Returns the Win32 error code equivalent of this error.
+    ///
+    /// Failures detected by this crate map to `ERROR_INVALID_SID`. Failures
+    /// reported by Windows return their original code.
+    pub const fn win32_code(&self) -> u32 {
+        match self {
+            Error::TooManySubAuthorities | Error::AuthorityOutOfRange | Error::InvalidSid => {
+                ERROR_INVALID_SID
+            }
+            Error::Windows(code) => *code,
+        }
     }
 
-    /// Returns the underlying Win32 error code.
-    pub const fn code(&self) -> u32 {
-        self.code
-    }
-
-    /// Captures the calling thread's last-error code.
-    fn from_thread() -> Self {
+    /// Captures the calling thread's last Win32 error code.
+    fn from_last_win32_error() -> Self {
         // SAFETY: GetLastError has no preconditions.
-        Self::from_win32(unsafe { bindings::GetLastError() })
+        Error::Windows(unsafe { bindings::GetLastError() })
     }
 }
 
@@ -181,17 +197,27 @@ impl std::error::Error for Error {}
 
 impl Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        Display::fmt(&std::io::Error::from_raw_os_error(self.code as i32), f)
+        match self {
+            Error::TooManySubAuthorities => write!(f, "a SID holds at most 15 sub-authorities"),
+            Error::AuthorityOutOfRange => {
+                write!(f, "the identifier authority does not fit in 48 bits")
+            }
+            Error::InvalidSid => write!(f, "not a valid SID"),
+            Error::Windows(code) => {
+                Display::fmt(&std::io::Error::from_raw_os_error(*code as i32), f)
+            }
+        }
+    }
+}
+
+impl From<Error> for std::io::Error {
+    fn from(error: Error) -> Self {
+        std::io::Error::from_raw_os_error(error.win32_code() as i32)
     }
 }
 
 /// A result returned by fallible `safe-sid` operations.
 pub type Result<T> = std::result::Result<T, Error>;
-
-/// Creates an error representing `ERROR_INVALID_SID`.
-fn invalid_sid_err() -> Error {
-    Error::from_win32(ERROR_INVALID_SID)
-}
 
 /// Converts a supported pointer wrapper to the raw pointer used by SID APIs.
 ///
@@ -258,8 +284,8 @@ pub trait IntoAuthority: sealed::Sealed {
     ///
     /// # Errors
     ///
-    /// Returns `ERROR_INVALID_SID` if the value cannot be represented in
-    /// 48 bits.
+    /// Returns [`Error::AuthorityOutOfRange`] if the value cannot be
+    /// represented in 48 bits.
     fn try_into_authority(self) -> Result<[u8; 6]>;
 }
 
@@ -282,7 +308,7 @@ macro_rules! impl_into_authority {
                     Ok(value) if value <= MAX_AUTHORITY => {
                         Ok(value.to_be_bytes()[2..].try_into().unwrap())
                     }
-                    _ => Err(invalid_sid_err()),
+                    _ => Err(Error::AuthorityOutOfRange),
                 }
             }
         }
@@ -395,8 +421,6 @@ impl Sid {
 
     /// Borrow a raw `PSID` as `&'a Sid`, validating its structure.
     ///
-    /// Returns `ERROR_INVALID_SID` if `psid` is not a valid SID.
-    ///
     /// # Safety
     ///
     /// `psid` must point to a readable SID that stays valid for `'a`. It must also be 4-byte
@@ -406,7 +430,7 @@ impl Sid {
     ///
     /// # Errors
     ///
-    /// Returns `ERROR_INVALID_SID` if the revision or sub-authority count is
+    /// Returns [`Error::InvalidSid`] if the revision or sub-authority count is
     /// outside the range allowed by Windows.
     pub unsafe fn from_psid<'a>(psid: impl AsSidPtr) -> Result<&'a Sid> {
         let psid = psid.as_sid_ptr();
@@ -415,7 +439,7 @@ impl Sid {
         let p = psid as *const u8;
         let (revision, sub_count) = unsafe { (*p, *p.add(1)) };
         if revision != SID_REVISION || sub_count > SID_MAX_SUB_AUTHORITIES {
-            return Err(invalid_sid_err());
+            return Err(Error::InvalidSid);
         }
 
         // Validate 4-byte alignment in debug mode
@@ -523,7 +547,7 @@ impl Sid {
             )
         } == 0
         {
-            return Err(Error::from_thread());
+            return Err(Error::from_last_win32_error());
         }
         Ok(equal != 0)
     }
@@ -545,8 +569,8 @@ impl Sid {
                 &mut len,
             ) == 0
             {
-                let error = Error::from_thread();
-                if error.code() != bindings::ERROR_INSUFFICIENT_BUFFER {
+                let error = Error::from_last_win32_error();
+                if error.win32_code() != bindings::ERROR_INSUFFICIENT_BUFFER {
                     return Err(error);
                 }
             }
@@ -558,7 +582,7 @@ impl Sid {
                 &mut len,
             ) == 0
             {
-                return Err(Error::from_thread());
+                return Err(Error::from_last_win32_error());
             }
             Ok(domain_sid)
         }
@@ -654,7 +678,7 @@ impl Debug for Sid {
 ///
 /// assert_eq!(borrowed.to_string(), "S-1-5-18");
 /// assert_eq!(borrowed.to_owned(), owned);
-/// # Ok::<(), safe_sid::ParseError>(())
+/// # Ok::<(), safe_sid::ParseSidError>(())
 /// ```
 pub struct SidBuf {
     sid: Box<Sid>,
@@ -666,21 +690,67 @@ impl Clone for SidBuf {
     }
 }
 
-#[derive(Debug)]
-/// The error returned when a string is not a valid numeric SID.
+/// The error returned when a string is not a valid SID.
 ///
-/// See [`SidBuf::from_str`](FromStr::from_str) for the accepted format.
-pub struct ParseError;
+/// Both [`SidBuf::from_str`](FromStr::from_str) and
+/// [`SidBuf::from_string_sid`] report this error; see those functions for the
+/// formats they accept. The [`From`] conversion to [`Error`] lets `?`
+/// propagate a parse failure from a function returning [`Result`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ParseSidError {
+    kind: ParseSidErrorKind,
+}
 
-impl std::error::Error for ParseError {}
-impl Display for ParseError {
+/// The private detail behind [`ParseSidError`], following the pattern of
+/// [`std::num::ParseIntError`]. Kept private so the cases can be refined
+/// without a breaking change; visible through `Debug` output only.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ParseSidErrorKind {
+    /// The string does not match the SID grammar.
+    Invalid,
+    /// The string contains an interior NUL byte, so it cannot be passed to
+    /// Windows.
+    InteriorNul,
+    /// `ConvertStringSidToSid` rejected the string with this Win32 error code.
+    Windows(u32),
+}
+
+impl ParseSidError {
+    fn invalid() -> Self {
+        Self {
+            kind: ParseSidErrorKind::Invalid,
+        }
+    }
+}
+
+impl std::error::Error for ParseSidError {}
+
+impl Display for ParseSidError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "invalid SID string")
+        match self.kind {
+            ParseSidErrorKind::Invalid => write!(f, "invalid SID string"),
+            ParseSidErrorKind::InteriorNul => {
+                write!(f, "SID string contains an interior NUL byte")
+            }
+            ParseSidErrorKind::Windows(code) => {
+                write!(
+                    f,
+                    "invalid SID string: {}",
+                    std::io::Error::from_raw_os_error(code as i32)
+                )
+            }
+        }
+    }
+}
+
+impl From<ParseSidError> for Error {
+    fn from(_: ParseSidError) -> Error {
+        Error::InvalidSid
     }
 }
 
 impl FromStr for SidBuf {
-    type Err = ParseError;
+    type Err = ParseSidError;
 
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
         let mut parts = s.split('-');
@@ -688,43 +758,45 @@ impl FromStr for SidBuf {
         // Leading "S", case-insensitive
         match parts.next() {
             Some(p) if p.eq_ignore_ascii_case("S") => {}
-            _ => return Err(ParseError),
+            _ => return Err(ParseSidError::invalid()),
         }
 
         // Revision (only 1 is allowed)
         if parts.next() != Some("1") {
-            return Err(ParseError);
+            return Err(ParseSidError::invalid());
         }
 
         // Identifier authority: decimal or 0x-prefixed hex, 48 bits max
-        let authority_str = parts.next().ok_or(ParseError)?;
+        let authority_str = parts.next().ok_or_else(ParseSidError::invalid)?;
         let authority = match authority_str
             .strip_prefix("0x")
             .or_else(|| authority_str.strip_prefix("0X"))
         {
             Some(hex) if !hex.is_empty() && hex.bytes().all(|b| b.is_ascii_hexdigit()) => {
-                u64::from_str_radix(hex, 16).map_err(|_| ParseError)?
+                u64::from_str_radix(hex, 16).map_err(|_| ParseSidError::invalid())?
             }
-            Some(_) => return Err(ParseError),
+            Some(_) => return Err(ParseSidError::invalid()),
             None if !authority_str.is_empty()
                 && authority_str.bytes().all(|b| b.is_ascii_digit()) =>
             {
-                authority_str.parse::<u64>().map_err(|_| ParseError)?
+                authority_str
+                    .parse::<u64>()
+                    .map_err(|_| ParseSidError::invalid())?
             }
-            None => return Err(ParseError),
+            None => return Err(ParseSidError::invalid()),
         };
         // Remaining fields are decimal sub-authorities
         let sub_authorities = parts
             .map(|p| {
                 if p.is_empty() || !p.bytes().all(|b| b.is_ascii_digit()) {
-                    return Err(ParseError);
+                    return Err(ParseSidError::invalid());
                 }
-                p.parse::<u32>().map_err(|_| ParseError)
+                p.parse::<u32>().map_err(|_| ParseSidError::invalid())
             })
             .collect::<std::result::Result<Vec<u32>, _>>()?;
 
         // new() rejects authorities over 48 bits and more than 15 sub-authorities
-        SidBuf::new(authority, &sub_authorities).map_err(|_| ParseError)
+        SidBuf::new(authority, &sub_authorities).map_err(|_| ParseSidError::invalid())
     }
 }
 
@@ -757,8 +829,9 @@ impl SidBuf {
     ///
     /// # Errors
     ///
-    /// Returns `ERROR_INVALID_SID` if more than 15 sub-authorities are given
-    /// or the authority cannot be represented in 48 bits.
+    /// Returns [`Error::TooManySubAuthorities`] if more than 15 sub-authorities
+    /// are given, or [`Error::AuthorityOutOfRange`] if the authority cannot be
+    /// represented in 48 bits.
     ///
     /// # Examples
     ///
@@ -777,7 +850,7 @@ impl SidBuf {
         let identifier_authority = identifier_authority.try_into_authority()?;
         let count = sub_authorities.len();
         if count > SID_MAX_SUB_AUTHORITIES as usize {
-            return Err(invalid_sid_err());
+            return Err(Error::TooManySubAuthorities);
         }
 
         let mut words = vec![0u32; SID_HEADER_WORDS + count].into_boxed_slice();
@@ -798,9 +871,9 @@ impl SidBuf {
     ///
     /// # Errors
     ///
-    /// Returns `ERROR_INVALID_SID` if the input is too short, has an unsupported
-    /// revision or sub-authority count, or does not have the exact length
-    /// required by its header.
+    /// Returns [`Error::InvalidSid`] if the input is too short, has an
+    /// unsupported revision or sub-authority count, or does not have the exact
+    /// length required by its header.
     ///
     /// # Examples
     ///
@@ -819,14 +892,14 @@ impl SidBuf {
     pub fn from_bytes(bytes: &[u8]) -> Result<SidBuf> {
         let header_len = SID_HEADER_WORDS * size_of::<u32>();
         if bytes.len() < header_len || bytes[0] != SID_REVISION {
-            return Err(invalid_sid_err());
+            return Err(Error::InvalidSid);
         }
 
         let count = bytes[1] as usize;
         if count > SID_MAX_SUB_AUTHORITIES as usize
             || bytes.len() != header_len + count * size_of::<u32>()
         {
-            return Err(invalid_sid_err());
+            return Err(Error::InvalidSid);
         }
 
         let identifier_authority: [u8; 6] = bytes[2..header_len].try_into().unwrap();
@@ -961,8 +1034,8 @@ impl SidBuf {
                 &mut len,
             ) == 0
             {
-                let error = Error::from_thread();
-                if error.code() != bindings::ERROR_INSUFFICIENT_BUFFER {
+                let error = Error::from_last_win32_error();
+                if error.win32_code() != bindings::ERROR_INSUFFICIENT_BUFFER {
                     return Err(error);
                 }
             }
@@ -978,7 +1051,7 @@ impl SidBuf {
                 &mut len,
             ) == 0
             {
-                return Err(Error::from_thread());
+                return Err(Error::from_last_win32_error());
             }
 
             Ok(SidBuf::from_boxed_words(words))
@@ -996,8 +1069,8 @@ impl SidBuf {
     ///
     /// # Errors
     ///
-    /// Returns `ERROR_INVALID_PARAMETER` if `s` contains an interior null byte.
-    /// Otherwise, returns the error reported by `ConvertStringSidToSidA`.
+    /// Returns [`ParseSidError`] if `s` contains an interior NUL byte or is
+    /// rejected by `ConvertStringSidToSidA`.
     ///
     /// # Examples
     ///
@@ -1006,18 +1079,21 @@ impl SidBuf {
     ///
     /// let administrators = SidBuf::from_string_sid("BA")?;
     /// assert_eq!(administrators.to_string(), "S-1-5-32-544");
-    /// # Ok::<(), safe_sid::Error>(())
+    /// # Ok::<(), safe_sid::ParseSidError>(())
     /// ```
-    pub fn from_string_sid(s: &str) -> Result<SidBuf> {
-        let s =
-            std::ffi::CString::new(s).map_err(|_| Error::from_win32(ERROR_INVALID_PARAMETER))?;
+    pub fn from_string_sid(s: &str) -> std::result::Result<SidBuf, ParseSidError> {
+        let s = std::ffi::CString::new(s).map_err(|_| ParseSidError {
+            kind: ParseSidErrorKind::InteriorNul,
+        })?;
 
         unsafe {
             let mut sid = std::ptr::null_mut();
             if bindings::ConvertStringSidToSidA(s.as_ptr().cast(), &mut sid) == 0 {
-                return Err(Error::from_thread());
+                return Err(ParseSidError {
+                    kind: ParseSidErrorKind::Windows(bindings::GetLastError()),
+                });
             }
-            let res = SidBuf::from_psid(sid);
+            let res = SidBuf::from_psid(sid).map_err(|_| ParseSidError::invalid());
             bindings::LocalFree(sid);
             res
         }
@@ -1025,7 +1101,8 @@ impl SidBuf {
 
     /// Validates and copies the SID pointed to by `psid` into an owned buffer.
     ///
-    /// Returns `ERROR_INVALID_SID` if the pointer does not reference a valid SID.
+    /// Returns [`Error::InvalidSid`] if the pointer does not reference a valid
+    /// SID.
     ///
     /// # Safety
     ///
@@ -1178,8 +1255,8 @@ mod tests {
             15
         );
         assert_eq!(
-            SidBuf::new([0; 6], &[0; 16]).unwrap_err().code(),
-            ERROR_INVALID_SID
+            SidBuf::new([0; 6], &[0; 16]).unwrap_err(),
+            Error::TooManySubAuthorities
         );
     }
 
@@ -1217,10 +1294,7 @@ mod tests {
             &[SID_REVISION, 0, 0, 0, 0, 0, 0, 5, 0, 0, 0, 0],
             &too_many_sub_authorities,
         ] {
-            assert_eq!(
-                SidBuf::from_bytes(bytes).unwrap_err().code(),
-                ERROR_INVALID_SID
-            );
+            assert_eq!(SidBuf::from_bytes(bytes).unwrap_err(), Error::InvalidSid);
         }
     }
 
@@ -1268,7 +1342,7 @@ mod tests {
             SidBuf::new(u128::MAX, &[]),
             SidBuf::new(i64::MIN, &[]),
         ] {
-            assert_eq!(result.unwrap_err().code(), ERROR_INVALID_SID);
+            assert_eq!(result.unwrap_err(), Error::AuthorityOutOfRange);
         }
     }
 
@@ -1291,11 +1365,20 @@ mod tests {
     }
 
     #[test]
-    fn error_exposes_its_win32_code() {
-        let error = Error::from_win32(ERROR_INVALID_SID);
+    fn errors_map_to_win32_codes() {
+        assert_eq!(Error::TooManySubAuthorities.win32_code(), ERROR_INVALID_SID);
+        assert_eq!(Error::AuthorityOutOfRange.win32_code(), ERROR_INVALID_SID);
+        assert_eq!(Error::InvalidSid.win32_code(), ERROR_INVALID_SID);
+        assert_eq!(Error::Windows(5).win32_code(), 5);
 
-        assert_eq!(error.code(), ERROR_INVALID_SID);
-        assert!(!error.to_string().is_empty());
+        let io_error: std::io::Error = Error::Windows(5).into();
+        assert_eq!(io_error.raw_os_error(), Some(5));
+
+        assert_eq!(Error::from(ParseSidError::invalid()), Error::InvalidSid);
+
+        for error in [Error::TooManySubAuthorities, Error::Windows(5)] {
+            assert!(!error.to_string().is_empty());
+        }
     }
 
     #[test]
@@ -1556,11 +1639,14 @@ mod tests {
 
     #[test]
     fn from_string_sid_fails_on_bad_input() {
-        assert!(SidBuf::from_string_sid("").is_err());
+        assert!(matches!(
+            SidBuf::from_string_sid("").unwrap_err().kind,
+            ParseSidErrorKind::Windows(_)
+        ));
         assert!(SidBuf::from_string_sid("not-a-sid").is_err());
-        assert_eq!(
-            SidBuf::from_string_sid("BA\0").unwrap_err().code(),
-            ERROR_INVALID_PARAMETER
-        );
+        assert!(matches!(
+            SidBuf::from_string_sid("BA\0").unwrap_err().kind,
+            ParseSidErrorKind::InteriorNul
+        ));
     }
 }
