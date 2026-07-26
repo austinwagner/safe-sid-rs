@@ -468,6 +468,15 @@ impl Sid {
         self.sub_authorities().get(idx as usize).copied()
     }
 
+    /// Returns the SID's relative identifier (RID).
+    ///
+    /// A RID is the final sub-authority. Returns `None` when the SID has no
+    /// sub-authorities.
+    #[inline]
+    pub fn rid(&self) -> Option<u32> {
+        self.sub_authorities().last().copied()
+    }
+
     /// Returns all of the SID's sub-authorities.
     #[inline]
     pub fn sub_authorities(&self) -> &[u32] {
@@ -781,6 +790,54 @@ impl SidBuf {
         Ok(Self::from_boxed_words(words))
     }
 
+    /// Copies a SID from its raw byte representation.
+    ///
+    /// The input does not need to be aligned. Its length must exactly match the
+    /// sub-authority count recorded in the SID header; trailing capacity is not
+    /// accepted.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ERROR_INVALID_SID` if the input is too short, has an unsupported
+    /// revision or sub-authority count, or does not have the exact length
+    /// required by its header.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use safe_sid::SidBuf;
+    ///
+    /// let bytes = [
+    ///     1, 2, 0, 0, 0, 0, 0, 5, // revision, count, NT authority
+    ///     32, 0, 0, 0,             // BUILTIN
+    ///     32, 2, 0, 0,             // Administrators
+    /// ];
+    /// let administrators = SidBuf::from_bytes(&bytes)?;
+    /// assert_eq!(administrators.to_string(), "S-1-5-32-544");
+    /// # Ok::<(), safe_sid::Error>(())
+    /// ```
+    pub fn from_bytes(bytes: &[u8]) -> Result<SidBuf> {
+        let header_len = SID_HEADER_WORDS * size_of::<u32>();
+        if bytes.len() < header_len || bytes[0] != SID_REVISION {
+            return Err(invalid_sid_err());
+        }
+
+        let count = bytes[1] as usize;
+        if count > SID_MAX_SUB_AUTHORITIES as usize
+            || bytes.len() != header_len + count * size_of::<u32>()
+        {
+            return Err(invalid_sid_err());
+        }
+
+        let identifier_authority: [u8; 6] = bytes[2..header_len].try_into().unwrap();
+        let sub_authorities = bytes[header_len..]
+            .chunks_exact(size_of::<u32>())
+            .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
+            .collect::<Vec<_>>();
+
+        SidBuf::new(identifier_authority, &sub_authorities)
+    }
+
     /// Allocates a `SidBuf` of `len` bytes for a Windows API to fill.
     ///
     /// The buffer initially contains the null SID (`S-1-0-0`). `len` is the
@@ -1079,6 +1136,20 @@ impl PartialEq<Sid> for SidBuf {
     }
 }
 
+impl PartialEq<&Sid> for SidBuf {
+    #[inline]
+    fn eq(&self, other: &&Sid) -> bool {
+        &**self == *other
+    }
+}
+
+impl PartialEq<SidBuf> for &Sid {
+    #[inline]
+    fn eq(&self, other: &SidBuf) -> bool {
+        *self == &**other
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::authority::*;
@@ -1110,6 +1181,53 @@ mod tests {
             SidBuf::new([0; 6], &[0; 16]).unwrap_err().code(),
             ERROR_INVALID_SID
         );
+    }
+
+    #[test]
+    fn from_bytes_copies_aligned_and_unaligned_sids() {
+        let expected = nt_sid(&[32, 544]);
+        let bytes = expected.as_bytes();
+
+        assert_eq!(SidBuf::from_bytes(bytes).unwrap(), expected);
+
+        let mut unaligned = vec![0xFF];
+        unaligned.extend_from_slice(bytes);
+        assert_eq!(SidBuf::from_bytes(&unaligned[1..]).unwrap(), expected);
+    }
+
+    #[test]
+    fn from_bytes_validates_the_complete_structure() {
+        let no_sub_authorities = [SID_REVISION, 0, 0, 0, 0, 0, 0, 5];
+        assert_eq!(
+            SidBuf::from_bytes(&no_sub_authorities)
+                .unwrap()
+                .sub_authorities(),
+            &[]
+        );
+
+        let mut too_many_sub_authorities =
+            vec![0; SID_HEADER_WORDS * size_of::<u32>() + 16 * size_of::<u32>()];
+        too_many_sub_authorities[0] = SID_REVISION;
+        too_many_sub_authorities[1] = SID_MAX_SUB_AUTHORITIES + 1;
+
+        for bytes in [
+            &[][..],
+            &[0, 0, 0, 0, 0, 0, 0, 0],
+            &[SID_REVISION, 1, 0, 0, 0, 0, 0, 5],
+            &[SID_REVISION, 0, 0, 0, 0, 0, 0, 5, 0, 0, 0, 0],
+            &too_many_sub_authorities,
+        ] {
+            assert_eq!(
+                SidBuf::from_bytes(bytes).unwrap_err().code(),
+                ERROR_INVALID_SID
+            );
+        }
+    }
+
+    #[test]
+    fn rid_returns_the_final_sub_authority() {
+        assert_eq!(nt_sid(&[21, 1, 2, 3, 1000]).rid(), Some(1000));
+        assert_eq!(SidBuf::new(5, &[]).unwrap().rid(), None);
     }
 
     #[test]
@@ -1288,6 +1406,12 @@ mod tests {
         assert_eq!(via_deref.to_owned(), owned);
         assert_eq!(*via_deref, owned);
         assert_eq!(owned, *via_deref);
+        assert_eq!(via_deref, owned);
+        assert_eq!(owned, via_deref);
+
+        let different = nt_sid(&[19]);
+        assert_ne!(via_deref, different);
+        assert_ne!(different, via_deref);
     }
 
     #[test]
