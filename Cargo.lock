@@ -38,7 +38,6 @@ version = "0.2.0"
 dependencies = [
  "windows",
  "windows-bindgen",
- "windows-core",
  "windows-link",
 ]
 

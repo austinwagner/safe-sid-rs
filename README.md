@@ -4,24 +4,19 @@ Safe wrapper for working with SIDs from the Windows API.
 
 Provides the borrowed/owned pair `&Sid` and `SidBuf` along with safe helper functions. Byte-compatible with the Windows `SID` struct. Defines equality and ordering traits so they can be compared and keyed on.
 
-Only depends on the `windows-core` and `windows-link` crates by default. If you want to have functions accept and return `windows::Win32::Security::PSID`, enable the `windows-full` feature.
+The crate only depends on `windows-link`. It deliberately uses raw pointers at
+its API boundary so it is not coupled to any version of the `windows` crate.
 
 ## Usage
 
 ```toml
 [dependencies]
-safe-sid = "0.1"
+safe-sid = "0.2"
 ```
 
-To accept and return `windows::Win32::Security::PSID` directly:
-
-```toml
-[dependencies]
-safe-sid = { version = "0.1", features = ["windows-full"] }
-windows = { version = "0.62", features = ["Win32_Security"] }
-```
-
-This allows `from_psid()` to accept the `PSID` type and enables the `as_psid()` function. Without it, you can still pass a raw `*const c_void` to `from_psid()` and get a similar raw pointer via `as_ptr()`.
+Applications using the `windows` crate can construct a `PSID` from
+`Sid::as_ptr()` at the call site, without requiring `safe-sid` to track the
+same `windows` version.
 
 ### Build a SID by hand
 
@@ -44,7 +39,7 @@ assert_eq!(local_system.to_string(), "S-1-5-18");
 fn sid_to_string(sid: &Sid) -> Result<String> {
     let mut hlocal_str = PSTR::null();
     unsafe {
-        ConvertSidToStringSidA(sid.as_psid(), &mut hlocal_str)?;
+        ConvertSidToStringSidA(PSID(sid.as_ptr().cast_mut()), &mut hlocal_str)?;
         let string_sid = CStr::from_ptr(hlocal_str.0 as *const _).to_str().unwrap().to_owned();
         LocalFree(Some(HLOCAL(hlocal_str.0 as *mut _)));
         Ok(string_sid)

@@ -14,6 +14,7 @@ fn main() {
         "CreateWellKnownSid",
         "ConvertStringSidToSidA",
         "EqualDomainSid",
+        "GetLastError",
         "GetWindowsAccountDomainSid",
         "IsWellKnownSid",
         "LocalFree",

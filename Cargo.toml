@@ -15,14 +15,11 @@ default-target = "x86_64-pc-windows-msvc"
 targets = ["x86_64-pc-windows-msvc"]
 rustdoc-args = ["--cfg", "docsrs"]
 
-[features]
-default = []
-windows-full = ["dep:windows"]
-
 [dependencies]
-windows-core = "0.62"
 windows-link = "0.2"
-windows = { version = "0.62", optional = true, default-features = false, features = [
+
+[dev-dependencies]
+windows = { version = "0.62", default-features = false, features = [
     "Win32_Security",
 ] }
 

@@ -22,7 +22,7 @@
 //! // S-1-5-32-544 is the BUILTIN\Administrators SID.
 //! let administrators = SidBuf::new([0, 0, 0, 0, 0, 5], &[32, 544])?;
 //! assert_eq!(administrators.to_string(), "S-1-5-32-544");
-//! # Ok::<(), windows_core::Error>(())
+//! # Ok::<(), safe_sid::Error>(())
 //! ```
 //!
 //! Or ask Windows to create a [well-known SID](well_known):
@@ -32,7 +32,7 @@
 //!
 //! let local_system = SidBuf::well_known(WinLocalSystemSid, None)?;
 //! assert_eq!(local_system.to_string(), "S-1-5-18");
-//! # Ok::<(), windows_core::Error>(())
+//! # Ok::<(), safe_sid::Error>(())
 //! ```
 //!
 //! Numeric SID strings can be parsed without calling Windows:
@@ -51,33 +51,29 @@
 //!
 //! # Windows API interoperability
 //!
-//! The default feature set has no dependency on the full `windows` crate.
-//! [`Sid::as_ptr`] and [`Sid::from_psid`] use raw `c_void` pointers in that
-//! configuration.
+//! This crate does not depend on the `windows` crate. [`Sid::as_ptr`] and
+//! [`Sid::from_psid`] use raw `c_void` pointers so applications can choose
+//! their own Windows bindings and versions.
 //!
-//! Enable the `windows-full` feature to also accept and return
-//! [`windows::Win32::Security::PSID`](https://microsoft.github.io/windows-docs-rs/doc/windows/Win32/Security/struct.PSID.html)
-//! values directly:
+//! An application using the `windows` crate can wrap the raw pointer at the
+//! call site:
 //!
 //! ```toml
 //! [dependencies]
-//! safe-sid = { version = "0.1", features = ["windows-full"] }
+//! safe-sid = "0.2"
 //! windows = { version = "0.62", features = ["Win32_Security"] }
 //! ```
 //!
 //! A borrowed SID can be passed to an API for the duration of the call:
 //!
 //! ```
-//! # #[cfg(feature = "windows-full")]
-//! # {
 //! use safe_sid::SidBuf;
-//! use windows::Win32::Security::GetLengthSid;
+//! use windows::Win32::Security::{GetLengthSid, PSID};
 //!
 //! let sid: SidBuf = "S-1-5-18".parse().unwrap();
 //! // The API must not retain or mutate the borrowed pointer.
-//! let byte_len = unsafe { GetLengthSid(sid.as_psid()) };
+//! let byte_len = unsafe { GetLengthSid(PSID(sid.as_ptr().cast_mut())) };
 //! assert_eq!(byte_len as usize, sid.as_bytes().len());
-//! # }
 //! ```
 //!
 //! Use [`SidBuf::with_capacity`] and [`SidBuf::as_mut_ptr`] for APIs that fill
@@ -97,7 +93,6 @@ use std::fmt::{Debug, Display};
 use std::hash::{Hash, Hasher};
 use std::ops::Deref;
 use std::str::FromStr;
-use windows_core::{Error, HRESULT, Result};
 
 #[allow(
     non_snake_case,
@@ -129,23 +124,61 @@ pub mod well_known {
 #[doc(no_inline)]
 pub use well_known::*;
 
-#[cfg(feature = "windows-full")]
-use windows::Win32::Security::{PSID, WELL_KNOWN_SID_TYPE as WINDOWS_WELL_KNOWN_SID_TYPE};
-
 const SID_REVISION: u8 = 1;
 const SID_MAX_SUB_AUTHORITIES: u8 = 15;
 const SID_HEADER_WORDS: usize = 2;
+const ERROR_INVALID_SID: u32 = 0x0539;
+
+/// An error reported while creating, validating, or querying a SID.
+///
+/// The contained value is a Win32 error code, available through [`Error::code`].
+/// This type is owned by `safe-sid`, so it remains stable independently of the
+/// version of `windows-core` used by an application.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[non_exhaustive]
+pub struct Error {
+    code: u32,
+}
+
+impl Error {
+    /// Creates an error from a Win32 error code.
+    pub const fn from_win32(code: u32) -> Self {
+        Self { code }
+    }
+
+    /// Returns the underlying Win32 error code.
+    pub const fn code(&self) -> u32 {
+        self.code
+    }
+
+    /// Captures the calling thread's last-error code.
+    fn from_thread() -> Self {
+        // SAFETY: GetLastError has no preconditions.
+        Self::from_win32(unsafe { bindings::GetLastError() })
+    }
+}
+
+impl std::error::Error for Error {}
+
+impl Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        Display::fmt(&std::io::Error::from_raw_os_error(self.code as i32), f)
+    }
+}
+
+/// A result returned by fallible `safe-sid` operations.
+pub type Result<T> = std::result::Result<T, Error>;
 
 /// Creates an error representing `ERROR_INVALID_SID`.
 fn invalid_sid_err() -> Error {
-    Error::from_hresult(HRESULT::from_win32(0x0539))
+    Error::from_win32(ERROR_INVALID_SID)
 }
 
 /// Converts a supported pointer wrapper to the raw pointer used by SID APIs.
 ///
 /// This trait lets [`Sid::from_psid`] and [`SidBuf::from_psid`] work with raw
-/// `c_void` pointers. With the `windows-full` feature they also accept
-/// [`windows::Win32::Security::PSID`](https://microsoft.github.io/windows-docs-rs/doc/windows/Win32/Security/struct.PSID.html).
+/// `c_void` pointers and user-defined pointer wrappers without depending on a
+/// particular Windows bindings crate.
 pub trait AsSidPtr {
     /// Returns the wrapped SID pointer.
     fn as_sid_ptr(&self) -> *const c_void;
@@ -154,8 +187,6 @@ pub trait AsSidPtr {
 /// Converts a well-known SID type to the value expected by Windows.
 ///
 /// The crate's constants, such as [`WinLocalSystemSid`], implement this trait.
-/// With the `windows-full` feature, the equivalent constants from the
-/// `windows` crate do as well.
 pub trait AsWellKnownSidType {
     /// Returns the numeric `WELL_KNOWN_SID_TYPE` value.
     fn as_well_known_sid_type(&self) -> WELL_KNOWN_SID_TYPE;
@@ -164,20 +195,6 @@ pub trait AsWellKnownSidType {
 impl AsWellKnownSidType for WELL_KNOWN_SID_TYPE {
     fn as_well_known_sid_type(&self) -> WELL_KNOWN_SID_TYPE {
         *self
-    }
-}
-
-#[cfg(feature = "windows-full")]
-impl AsWellKnownSidType for WINDOWS_WELL_KNOWN_SID_TYPE {
-    fn as_well_known_sid_type(&self) -> WELL_KNOWN_SID_TYPE {
-        self.0
-    }
-}
-
-#[cfg(feature = "windows-full")]
-impl AsSidPtr for PSID {
-    fn as_sid_ptr(&self) -> *const c_void {
-        self.0
     }
 }
 
@@ -280,19 +297,6 @@ impl Sid {
         unsafe {
             std::slice::from_raw_parts(self as *const Sid as *const u8, word_len * size_of::<u32>())
         }
-    }
-
-    /// Returns a `PSID` pointing at this SID for use with Windows APIs.
-    ///
-    /// # Safety
-    ///
-    /// The returned pointer is borrowed from `self` and must not outlive it.
-    /// Although `PSID` contains a mutable pointer, the pointee must not be
-    /// mutated through this shared reference.
-    #[cfg(feature = "windows-full")]
-    #[inline]
-    pub unsafe fn as_psid(&self) -> PSID {
-        PSID(self as *const Sid as *mut _)
     }
 
     /// Returns a raw pointer to this SID for use with Windows APIs.
@@ -438,7 +442,7 @@ impl Sid {
             ) == 0
             {
                 let error = Error::from_thread();
-                if error.code() != HRESULT::from_win32(bindings::ERROR_INSUFFICIENT_BUFFER) {
+                if error.code() != bindings::ERROR_INSUFFICIENT_BUFFER {
                     return Err(error);
                 }
             }
@@ -646,7 +650,7 @@ impl SidBuf {
     ///
     /// let administrators = SidBuf::new([0, 0, 0, 0, 0, 5], &[32, 544])?;
     /// assert_eq!(administrators.to_string(), "S-1-5-32-544");
-    /// # Ok::<(), windows_core::Error>(())
+    /// # Ok::<(), safe_sid::Error>(())
     /// ```
     pub fn new(identifier_authority: [u8; 6], sub_authorities: &[u32]) -> Result<Self> {
         let count = sub_authorities.len();
@@ -705,12 +709,10 @@ impl SidBuf {
     /// the allocated SID and domain-name buffers.
     ///
     /// ```no_run
-    /// # #[cfg(feature = "windows-full")]
-    /// # {
     /// use safe_sid::SidBuf;
     /// use std::ffi::CStr;
     /// use windows::Win32::Security::{LookupAccountNameA, PSID, SID_NAME_USE};
-    /// use windows_core::{HRESULT, PCSTR, PSTR, Result};
+    /// use windows::core::{HRESULT, PCSTR, PSTR, Result};
     ///
     /// fn lookup_account_name(name: &CStr) -> Result<SidBuf> {
     ///     let mut sid_use = SID_NAME_USE::default();
@@ -747,7 +749,6 @@ impl SidBuf {
     /// }
     ///
     /// # let _ = lookup_account_name;
-    /// # }
     /// ```
     pub unsafe fn as_mut_ptr(&mut self) -> *mut c_void {
         let sid: &mut Sid = &mut self.sid;
@@ -770,7 +771,7 @@ impl SidBuf {
     ///
     /// let local_system = SidBuf::well_known(WinLocalSystemSid, None)?;
     /// assert_eq!(local_system.to_string(), "S-1-5-18");
-    /// # Ok::<(), windows_core::Error>(())
+    /// # Ok::<(), safe_sid::Error>(())
     /// ```
     pub fn well_known(
         well_known_type: impl AsWellKnownSidType,
@@ -790,7 +791,7 @@ impl SidBuf {
             ) == 0
             {
                 let error = Error::from_thread();
-                if error.code() != HRESULT::from_win32(bindings::ERROR_INSUFFICIENT_BUFFER) {
+                if error.code() != bindings::ERROR_INSUFFICIENT_BUFFER {
                     return Err(error);
                 }
             }
@@ -828,7 +829,7 @@ impl SidBuf {
     ///
     /// let administrators = SidBuf::from_cstr_with_alias(c"BA")?;
     /// assert_eq!(administrators.to_string(), "S-1-5-32-544");
-    /// # Ok::<(), windows_core::Error>(())
+    /// # Ok::<(), safe_sid::Error>(())
     /// ```
     pub fn from_cstr_with_alias(s: &std::ffi::CStr) -> Result<SidBuf> {
         unsafe {
@@ -863,7 +864,7 @@ impl SidBuf {
     ///
     /// assert_eq!(borrowed, &*source);
     /// assert_eq!(copied, source);
-    /// # Ok::<(), windows_core::Error>(())
+    /// # Ok::<(), safe_sid::Error>(())
     /// ```
     pub unsafe fn from_psid(psid: impl AsSidPtr) -> Result<Self> {
         // SAFETY: safety requirements noted to called in the doc comment
@@ -982,7 +983,18 @@ mod tests {
             SidBuf::new([0; 6], &[7; 15]).unwrap().sub_authority_count(),
             15
         );
-        assert!(SidBuf::new([0; 6], &[0; 16]).is_err());
+        assert_eq!(
+            SidBuf::new([0; 6], &[0; 16]).unwrap_err().code(),
+            ERROR_INVALID_SID
+        );
+    }
+
+    #[test]
+    fn error_exposes_its_win32_code() {
+        let error = Error::from_win32(ERROR_INVALID_SID);
+
+        assert_eq!(error.code(), ERROR_INVALID_SID);
+        assert!(!error.to_string().is_empty());
     }
 
     #[test]
@@ -1035,25 +1047,6 @@ mod tests {
         };
 
         assert_eq!(copied.to_string(), "S-1-5-18");
-    }
-
-    #[cfg(feature = "windows-full")]
-    #[test]
-    fn windows_psid_interoperates_when_enabled() {
-        let source = nt_sid(&[18]);
-        let psid = unsafe { source.as_psid() };
-
-        assert_eq!(unsafe { Sid::from_psid(psid) }.unwrap(), &*source);
-    }
-
-    #[cfg(feature = "windows-full")]
-    #[test]
-    fn windows_well_known_sid_types_interoperate_when_enabled() {
-        use windows::Win32::Security::WinLocalSystemSid as WindowsWinLocalSystemSid;
-
-        let local_system = SidBuf::well_known(WindowsWinLocalSystemSid, None).unwrap();
-
-        assert!(local_system.is_well_known(WindowsWinLocalSystemSid));
     }
 
     #[test]
