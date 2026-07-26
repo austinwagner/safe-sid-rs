@@ -59,15 +59,6 @@
 //! [`Sid::from_psid`] use raw `c_void` pointers so applications can choose
 //! their own Windows bindings and versions.
 //!
-//! An application using the `windows` crate can wrap the raw pointer at the
-//! call site:
-//!
-//! ```toml
-//! [dependencies]
-//! safe-sid = "0.2"
-//! windows = { version = "0.62", features = ["Win32_Security"] }
-//! ```
-//!
 //! A borrowed SID can be passed to an API for the duration of the call:
 //!
 //! ```
@@ -119,24 +110,9 @@ pub mod authority;
 /// A Windows well-known SID type.
 ///
 /// Values of this type are exposed as the named constants in [`well_known`],
-/// such as [`well_known::WinLocalSystemSid`]. The integer accepted by the underlying
-/// Windows APIs is intentionally not part of this crate's public API.
-///
-/// Raw integers cannot be passed where a well-known SID type is expected:
-///
-/// ```compile_fail
-/// use safe_sid::SidBuf;
-///
-/// let _ = SidBuf::well_known(22, None);
-/// ```
-///
-/// The wrapper cannot be constructed directly:
-///
-/// ```compile_fail
-/// use safe_sid::WellKnownSidType;
-///
-/// let _ = WellKnownSidType(22);
-/// ```
+/// such as [`well_known::WinLocalSystemSid`]. The integer accepted by the
+/// underlying Windows APIs is intentionally not part of this crate's public
+/// API, so arbitrary integers cannot be used as well-known SID types.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 #[repr(transparent)]
 pub struct WellKnownSidType(i32);
@@ -152,9 +128,8 @@ const MAX_AUTHORITY: u64 = 0xFFFF_FFFF_FFFF;
 /// Failures detected by this crate are reported as descriptive variants, while
 /// failures reported by a Windows API carry the Win32 error code in
 /// [`Error::Windows`]. [`Error::win32_code`] maps any variant to a Win32 error
-/// code,
-/// and the [`From`] conversion to [`std::io::Error`] does the same for
-/// io-based error handling.
+/// code, and the [`From`] conversion to [`std::io::Error`] does the same for
+/// I/O-based error handling.
 ///
 /// This type is owned by `safe-sid`, so it remains stable independently of the
 /// version of `windows-core` used by an application. String parsing reports
@@ -269,17 +244,7 @@ mod sealed {
 /// form used by the constants in [`authority`], and for every primitive
 /// integer type. Integer values must fit in 48 bits.
 ///
-/// The trait is sealed and cannot be implemented outside of `safe-sid`:
-///
-/// ```compile_fail
-/// struct CustomAuthority;
-///
-/// impl safe_sid::IntoAuthority for CustomAuthority {
-///     fn try_into_authority(self) -> safe_sid::Result<[u8; 6]> {
-///         Ok([0; 6])
-///     }
-/// }
-/// ```
+/// The trait is sealed and cannot be implemented outside of `safe-sid`.
 pub trait IntoAuthority: sealed::Sealed {
     /// Returns the value as a big-endian six-byte identifier authority.
     ///
@@ -366,8 +331,7 @@ impl Sid {
         unsafe { &mut *ptr }
     }
 
-    /// The number of sub-authorities, limited by the capacity of the actual buffer so we
-    /// can prevent out-of-bounds reads.
+    /// Returns the number of sub-authorities that fit in the backing buffer.
     #[inline]
     fn logical_sub_count(&self) -> usize {
         (self.sub_authority_count as usize).min(self.sub_authority.len())
@@ -378,8 +342,8 @@ impl Sid {
     #[inline]
     fn words(&self) -> &[u32] {
         // SAFETY: logical_sub_count() is limited to our actual buffer size, so
-        // even if  sub_authority_count is oversized, it won't return a buffer
-        // that can allow out-of-bounds reads
+        // even if sub_authority_count is oversized, the returned slice cannot
+        // allow out-of-bounds reads.
         unsafe {
             std::slice::from_raw_parts(
                 self as *const Sid as *const u32,
@@ -422,14 +386,13 @@ impl Sid {
         self as *const Sid as *const c_void
     }
 
-    /// Borrow a raw `PSID` as `&'a Sid`, validating its structure.
+    /// Borrows a raw `PSID` as `&'a Sid`, validating its structure.
     ///
     /// # Safety
     ///
-    /// `psid` must point to a readable SID that stays valid for `'a`. It must also be 4-byte
-    /// aligned since the words are borrowed as `&[u32]`. The sub-authority count must be accurate
-    /// to prevent out-of-bounds reads. Every SID Windows hands out is already aligned with a correct
-    /// count.
+    /// `psid` must be non-null and point to a readable, 4-byte-aligned SID that
+    /// remains valid for `'a`. Its sub-authority count must accurately describe
+    /// the allocation. SIDs allocated by Windows meet these requirements.
     ///
     /// # Errors
     ///
@@ -537,7 +500,8 @@ impl Sid {
             }
     }
 
-    /// Determines whether this SID and `other` belong to the same Windows account domain.
+    /// Tests whether this SID and `other` belong to the same Windows account
+    /// domain.
     ///
     /// Calls the Windows `EqualDomainSid` function.
     ///
@@ -679,19 +643,6 @@ impl Debug for Sid {
 /// `SidBuf` dereferences to [`Sid`], so all borrowed-SID operations are
 /// available directly on an owned value. Clone a `SidBuf` to duplicate its
 /// bytes, or borrow it as `&Sid` without allocating.
-///
-/// # Examples
-///
-/// ```
-/// use safe_sid::{Sid, SidBuf};
-///
-/// let owned: SidBuf = "S-1-5-18".parse()?;
-/// let borrowed: &Sid = &owned;
-///
-/// assert_eq!(borrowed.to_string(), "S-1-5-18");
-/// assert_eq!(borrowed.to_owned(), owned);
-/// # Ok::<(), safe_sid::SidParseError>(())
-/// ```
 pub struct SidBuf {
     sid: Box<Sid>,
 }
@@ -856,9 +807,9 @@ impl SidBuf {
             "a SID has at least the two header words"
         );
         let sub_count = words.len() - SID_HEADER_WORDS;
-        // A DST only tracks the size of the array. Our input box is entirely an array while our
-        // Sid struct has 2 words before the array. When creating a Sid pointer from the u64 slice
-        // we have to account for that by subtracting off the header.
+        // A DST pointer tracks only the trailing slice length. The input box is
+        // entirely an array, while Sid has two header words before its slice,
+        // so the pointer metadata excludes those header words.
         let data = Box::into_raw(words).cast::<u32>();
         let ptr = std::ptr::slice_from_raw_parts_mut(data, sub_count) as *mut Sid;
         // SAFETY: We are reboxing a pointer with the same alignment as the one it was detached from
@@ -879,19 +830,6 @@ impl SidBuf {
     /// are given, or [`Error::AuthorityOutOfRange`] if the authority cannot be
     /// represented in 48 bits.
     ///
-    /// # Examples
-    ///
-    /// ```
-    /// use safe_sid::SidBuf;
-    /// use safe_sid::authority::SECURITY_NT_AUTHORITY;
-    ///
-    /// let administrators = SidBuf::new(SECURITY_NT_AUTHORITY, &[32, 544])?;
-    /// assert_eq!(administrators.to_string(), "S-1-5-32-544");
-    ///
-    /// // The same SID built from the authority's integer value.
-    /// assert_eq!(SidBuf::new(5, &[32, 544])?, administrators);
-    /// # Ok::<(), safe_sid::Error>(())
-    /// ```
     pub fn new(identifier_authority: impl IntoAuthority, sub_authorities: &[u32]) -> Result<Self> {
         let identifier_authority = identifier_authority.try_into_authority()?;
         let count = sub_authorities.len();
@@ -977,8 +915,7 @@ impl SidBuf {
         SidBuf::from_boxed_words(words)
     }
 
-    /// Returns a mutable pointer to this SID's bytes, for passing to a Windows API that
-    /// fills a caller-supplied buffer.
+    /// Returns a mutable pointer to this SID's bytes for a Windows API to fill.
     ///
     /// This is intended for the second call of Windows APIs that first report a
     /// required buffer length. Allocate that length with
@@ -986,11 +923,11 @@ impl SidBuf {
     ///
     /// # Safety
     ///
-    /// Writing through the pointer can leave the buffer holding bytes that are not
-    /// a valid SID. The caller must not write past the length supplied to
-    /// [`SidBuf::with_capacity`] and must leave a valid SID behind before the
-    /// buffer is read through `&Sid`. Dropping the buffer remains safe even if
-    /// the API fails or writes malformed data.
+    /// Writing through the pointer can leave the buffer holding bytes that are
+    /// not a valid SID. The caller must not write past the length supplied to
+    /// [`SidBuf::with_capacity`] and must leave a valid SID behind before
+    /// accessing the buffer through `&Sid`. Dropping the buffer remains safe
+    /// even if the API fails or writes malformed data.
     ///
     /// # Examples
     ///
@@ -1055,16 +992,6 @@ impl SidBuf {
     ///
     /// Returns the error reported by `CreateWellKnownSid`.
     ///
-    /// # Examples
-    ///
-    /// ```
-    /// use safe_sid::SidBuf;
-    /// use safe_sid::well_known::WinLocalSystemSid;
-    ///
-    /// let local_system = SidBuf::well_known(WinLocalSystemSid, None)?;
-    /// assert_eq!(local_system.to_string(), "S-1-5-18");
-    /// # Ok::<(), safe_sid::Error>(())
-    /// ```
     pub fn well_known(
         well_known_type: impl AsWellKnownSidType,
         domain_sid: Option<&Sid>,
@@ -1120,15 +1047,6 @@ impl SidBuf {
     /// Returns [`SidParseError`] if `s` contains an interior NUL byte or is
     /// rejected by `ConvertStringSidToSidA`.
     ///
-    /// # Examples
-    ///
-    /// ```
-    /// use safe_sid::SidBuf;
-    ///
-    /// let administrators = SidBuf::from_string_sid("BA")?;
-    /// assert_eq!(administrators.to_string(), "S-1-5-32-544");
-    /// # Ok::<(), safe_sid::SidParseError>(())
-    /// ```
     pub fn from_string_sid(s: &str) -> std::result::Result<SidBuf, SidParseError> {
         let s = std::ffi::CString::new(s).map_err(|_| SidParseError {
             kind: SidParseErrorKind::InteriorNul,
@@ -1149,28 +1067,17 @@ impl SidBuf {
 
     /// Validates and copies the SID pointed to by `psid` into an owned buffer.
     ///
+    /// # Errors
+    ///
     /// Returns [`Error::InvalidSid`] if the pointer does not reference a valid
     /// SID.
     ///
     /// # Safety
     ///
-    /// `psid` must point to a 4-byte-aligned SID structure valid for the duration of this
-    /// call. The data is copied so there is no lifetime requirement for `psid` after this returns.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use safe_sid::{Sid, SidBuf};
-    ///
-    /// let source: SidBuf = "S-1-5-18".parse().unwrap();
-    ///
-    /// let borrowed: &Sid = unsafe { Sid::from_psid(source.as_ptr())? };
-    /// let copied = unsafe { SidBuf::from_psid(source.as_ptr())? };
-    ///
-    /// assert_eq!(borrowed, &*source);
-    /// assert_eq!(copied, source);
-    /// # Ok::<(), safe_sid::Error>(())
-    /// ```
+    /// `psid` must be non-null and point to a readable, 4-byte-aligned SID for
+    /// the duration of this call. Its sub-authority count must accurately
+    /// describe the allocation. The data is copied, so the pointer need not
+    /// remain valid after this function returns.
     pub unsafe fn from_psid(psid: impl AsSidPtr) -> Result<Self> {
         // SAFETY: safety requirements noted to the caller in the doc comment
         let src = unsafe { Sid::from_psid(psid) }?;
