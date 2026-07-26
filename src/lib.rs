@@ -50,7 +50,7 @@
 //! # Ok::<(), safe_sid::ParseError>(())
 //! ```
 //!
-//! [`SidBuf::from_cstr_with_alias`] additionally accepts Windows aliases such
+//! [`SidBuf::from_string_sid`] additionally accepts Windows aliases such
 //! as `BA` (BUILTIN\Administrators).
 //!
 //! # Windows API interoperability
@@ -144,6 +144,7 @@ pub struct WellKnownSidType(i32);
 const SID_REVISION: u8 = 1;
 const SID_MAX_SUB_AUTHORITIES: u8 = 15;
 const SID_HEADER_WORDS: usize = 2;
+const ERROR_INVALID_PARAMETER: u32 = 0x0057;
 const ERROR_INVALID_SID: u32 = 0x0539;
 const MAX_AUTHORITY: u64 = 0xFFFF_FFFF_FFFF;
 
@@ -690,14 +691,26 @@ impl FromStr for SidBuf {
             .strip_prefix("0x")
             .or_else(|| authority_str.strip_prefix("0X"))
         {
-            Some(hex) => u64::from_str_radix(hex, 16).map_err(|_| ParseError)?,
-            None => authority_str.parse::<u64>().map_err(|_| ParseError)?,
+            Some(hex) if !hex.is_empty() && hex.bytes().all(|b| b.is_ascii_hexdigit()) => {
+                u64::from_str_radix(hex, 16).map_err(|_| ParseError)?
+            }
+            Some(_) => return Err(ParseError),
+            None if !authority_str.is_empty()
+                && authority_str.bytes().all(|b| b.is_ascii_digit()) =>
+            {
+                authority_str.parse::<u64>().map_err(|_| ParseError)?
+            }
+            None => return Err(ParseError),
         };
         // Remaining fields are decimal sub-authorities
         let sub_authorities = parts
-            .map(|p| p.parse::<u32>())
-            .collect::<std::result::Result<Vec<u32>, _>>()
-            .map_err(|_| ParseError)?;
+            .map(|p| {
+                if p.is_empty() || !p.bytes().all(|b| b.is_ascii_digit()) {
+                    return Err(ParseError);
+                }
+                p.parse::<u32>().map_err(|_| ParseError)
+            })
+            .collect::<std::result::Result<Vec<u32>, _>>()?;
 
         // new() rejects authorities over 48 bits and more than 15 sub-authorities
         SidBuf::new(authority, &sub_authorities).map_err(|_| ParseError)
@@ -911,26 +924,33 @@ impl SidBuf {
         }
     }
 
-    /// Converts a C string to a SID with `ConvertStringSidToSidA`.
+    /// Converts a string SID to a SID with `ConvertStringSidToSidA`.
     ///
     /// Unlike [`FromStr`], this accepts string constants such as `BA` and `AU`
     /// in addition to numeric SIDs. Windows performs the parsing and may clamp
     /// overflowing numeric components instead of rejecting them.
     ///
+    /// String SIDs and their constants are ASCII. This method converts the
+    /// input to a C string before passing it to the ANSI Windows API.
+    ///
     /// # Errors
     ///
-    /// Returns the error reported by `ConvertStringSidToSidA`.
+    /// Returns `ERROR_INVALID_PARAMETER` if `s` contains an interior null byte.
+    /// Otherwise, returns the error reported by `ConvertStringSidToSidA`.
     ///
     /// # Examples
     ///
     /// ```
     /// use safe_sid::SidBuf;
     ///
-    /// let administrators = SidBuf::from_cstr_with_alias(c"BA")?;
+    /// let administrators = SidBuf::from_string_sid("BA")?;
     /// assert_eq!(administrators.to_string(), "S-1-5-32-544");
     /// # Ok::<(), safe_sid::Error>(())
     /// ```
-    pub fn from_cstr_with_alias(s: &std::ffi::CStr) -> Result<SidBuf> {
+    pub fn from_string_sid(s: &str) -> Result<SidBuf> {
+        let s =
+            std::ffi::CString::new(s).map_err(|_| Error::from_win32(ERROR_INVALID_PARAMETER))?;
+
         unsafe {
             let mut sid = std::ptr::null_mut();
             if bindings::ConvertStringSidToSidA(s.as_ptr().cast(), &mut sid) == 0 {
@@ -1323,6 +1343,9 @@ mod tests {
             "S-2-5-18",                                     // unsupported revision
             "S-1",                                          // missing authority
             "S-1-5-",                                       // trailing separator
+            "S-1-+5-18",                                    // signed decimal authority
+            "S-1-0x+5-18",                                  // signed hexadecimal authority
+            "S-1-5-+18",                                    // signed sub-authority
             "S-1-5-4294967296",                             // sub-authority overflows u32
             "S-1-0x1000000000000-1",                        // authority overflows 48 bits
             "S-1-5-1-2-3-4-5-6-7-8-9-10-11-12-13-14-15-16", // more than 15 sub-authorities
@@ -1391,15 +1414,19 @@ mod tests {
     }
 
     #[test]
-    fn from_cstr_supports_numeric_and_aliases() {
+    fn from_string_sid_supports_numeric_and_aliases() {
         let ba = nt_sid(&[32, 544]);
-        assert_eq!(SidBuf::from_cstr_with_alias(c"BA").unwrap(), ba);
-        assert_eq!(SidBuf::from_cstr_with_alias(c"S-1-5-32-544").unwrap(), ba);
+        assert_eq!(SidBuf::from_string_sid("BA").unwrap(), ba);
+        assert_eq!(SidBuf::from_string_sid("S-1-5-32-544").unwrap(), ba);
     }
 
     #[test]
-    fn from_cstr_fails_on_bad_input() {
-        assert!(SidBuf::from_cstr_with_alias(c"").is_err());
-        assert!(SidBuf::from_cstr_with_alias(c"not-a-sid").is_err());
+    fn from_string_sid_fails_on_bad_input() {
+        assert!(SidBuf::from_string_sid("").is_err());
+        assert!(SidBuf::from_string_sid("not-a-sid").is_err());
+        assert_eq!(
+            SidBuf::from_string_sid("BA\0").unwrap_err().code(),
+            ERROR_INVALID_PARAMETER
+        );
     }
 }
