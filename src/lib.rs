@@ -598,7 +598,9 @@ impl PartialOrd for Sid {
 impl Ord for Sid {
     #[inline]
     fn cmp(&self, other: &Self) -> Ordering {
-        self.as_bytes().cmp(other.as_bytes())
+        self.authority()
+            .cmp(&other.authority())
+            .then_with(|| self.sub_authorities().cmp(other.sub_authorities()))
     }
 }
 
@@ -1357,7 +1359,7 @@ mod tests {
     }
 
     #[test]
-    fn equality_and_ordering_follow_sid_bytes() {
+    fn equality_and_ordering_follow_sid_fields_numerically() {
         let a = nt_sid(&[18]);
         let b = nt_sid(&[18]);
         let c = nt_sid(&[19]);
@@ -1365,6 +1367,12 @@ mod tests {
         assert_ne!(a, c);
 
         assert!(a < nt_sid(&[32, 544]));
+        assert!(nt_sid(&[1]) < nt_sid(&[256]));
+        assert!(nt_sid(&[21, 1]) < nt_sid(&[21, 1, 1]));
+
+        let lower_authority = SidBuf::new(4, &[u32::MAX, u32::MAX]).unwrap();
+        let higher_authority = SidBuf::new(5, &[0]).unwrap();
+        assert!(lower_authority < higher_authority);
     }
 
     #[test]
