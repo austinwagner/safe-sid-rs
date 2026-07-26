@@ -47,7 +47,7 @@
 //! let sid: SidBuf = "S-1-5-18".parse()?;
 //! assert_eq!(sid.authority(), 5);
 //! assert_eq!(sid.sub_authorities(), [18]);
-//! # Ok::<(), safe_sid::ParseSidError>(())
+//! # Ok::<(), safe_sid::SidParseError>(())
 //! ```
 //!
 //! [`SidBuf::from_string_sid`] additionally accepts Windows aliases such
@@ -158,7 +158,7 @@ const MAX_AUTHORITY: u64 = 0xFFFF_FFFF_FFFF;
 ///
 /// This type is owned by `safe-sid`, so it remains stable independently of the
 /// version of `windows-core` used by an application. String parsing reports
-/// [`ParseSidError`] instead, which converts into this type via [`From`].
+/// [`SidParseError`] instead, which converts into this type via [`From`].
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 #[non_exhaustive]
 pub enum Error {
@@ -177,6 +177,7 @@ impl Error {
     ///
     /// Failures detected by this crate map to `ERROR_INVALID_SID`. Failures
     /// reported by Windows return their original code.
+    #[must_use]
     pub const fn win32_code(&self) -> u32 {
         match self {
             Error::TooManySubAuthorities | Error::AuthorityOutOfRange | Error::InvalidSid => {
@@ -393,6 +394,7 @@ impl Sid {
     /// sub-authority. Spare capacity in a [`SidBuf::with_capacity`] allocation
     /// is not included.
     #[inline]
+    #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
         let words = self.words();
         // SAFETY: [u32] has a stronger alignment requirement than [u8], size is computed accurately
@@ -415,6 +417,7 @@ impl Sid {
     ///
     /// The pointer remains valid only while `self` is alive and has not been
     /// mutably borrowed. The called API must not mutate the SID through it.
+    #[must_use]
     pub fn as_ptr(&self) -> *const c_void {
         self as *const Sid as *const c_void
     }
@@ -460,18 +463,21 @@ impl Sid {
     ///
     /// Valid Windows SIDs currently have revision 1.
     #[inline]
+    #[must_use]
     pub fn revision(&self) -> u8 {
         self.revision
     }
 
     /// Returns the number of sub-authorities recorded in the SID header.
     #[inline]
+    #[must_use]
     pub fn sub_authority_count(&self) -> u8 {
         self.sub_authority_count
     }
 
     /// Returns the 48-bit identifier authority as an integer.
     #[inline]
+    #[must_use]
     pub fn authority(&self) -> u64 {
         let [a0, a1, a2, a3, a4, a5] = self.identifier_authority;
         u64::from_be_bytes([0, 0, a0, a1, a2, a3, a4, a5])
@@ -482,12 +488,14 @@ impl Sid {
     /// This is the representation used by the constants in [`authority`] and
     /// accepted by [`SidBuf::new`].
     #[inline]
+    #[must_use]
     pub fn authority_bytes(&self) -> [u8; 6] {
         self.identifier_authority
     }
 
     /// Returns the sub-authority at `idx`, or `None` if it is out of bounds.
     #[inline]
+    #[must_use]
     pub fn sub_authority(&self, idx: u8) -> Option<u32> {
         self.sub_authorities().get(idx as usize).copied()
     }
@@ -497,12 +505,14 @@ impl Sid {
     /// A RID is the final sub-authority. Returns `None` when the SID has no
     /// sub-authorities.
     #[inline]
+    #[must_use]
     pub fn rid(&self) -> Option<u32> {
         self.sub_authorities().last().copied()
     }
 
     /// Returns all of the SID's sub-authorities.
     #[inline]
+    #[must_use]
     pub fn sub_authorities(&self) -> &[u32] {
         &self.sub_authority[..self.logical_sub_count()]
     }
@@ -512,6 +522,7 @@ impl Sid {
     /// A SID prefix contains the revision, identifier authority, sub-authority
     /// count, and every sub-authority except the last.
     #[inline]
+    #[must_use]
     pub fn equal_prefix(&self, other: &Sid) -> bool {
         self.revision == other.revision
             && self.identifier_authority == other.identifier_authority
@@ -592,6 +603,7 @@ impl Sid {
     ///
     /// Calls the Windows `IsWellKnownSid` function.
     #[inline]
+    #[must_use]
     pub fn is_well_known(&self, well_known_type: impl AsWellKnownSidType) -> bool {
         let well_known_type = well_known_type.as_well_known_sid_type();
         // SAFETY: self supplies a valid SID pointer
@@ -678,7 +690,7 @@ impl Debug for Sid {
 ///
 /// assert_eq!(borrowed.to_string(), "S-1-5-18");
 /// assert_eq!(borrowed.to_owned(), owned);
-/// # Ok::<(), safe_sid::ParseSidError>(())
+/// # Ok::<(), safe_sid::SidParseError>(())
 /// ```
 pub struct SidBuf {
     sid: Box<Sid>,
@@ -697,15 +709,15 @@ impl Clone for SidBuf {
 /// formats they accept. The [`From`] conversion to [`Error`] lets `?`
 /// propagate a parse failure from a function returning [`Result`].
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ParseSidError {
-    kind: ParseSidErrorKind,
+pub struct SidParseError {
+    kind: SidParseErrorKind,
 }
 
-/// The private detail behind [`ParseSidError`], following the pattern of
+/// The private detail behind [`SidParseError`], following the pattern of
 /// [`std::num::ParseIntError`]. Kept private so the cases can be refined
 /// without a breaking change; visible through `Debug` output only.
 #[derive(Clone, Debug, Eq, PartialEq)]
-enum ParseSidErrorKind {
+enum SidParseErrorKind {
     /// The string does not match the SID grammar.
     Invalid,
     /// The string contains an interior NUL byte, so it cannot be passed to
@@ -715,24 +727,24 @@ enum ParseSidErrorKind {
     Windows(u32),
 }
 
-impl ParseSidError {
+impl SidParseError {
     fn invalid() -> Self {
         Self {
-            kind: ParseSidErrorKind::Invalid,
+            kind: SidParseErrorKind::Invalid,
         }
     }
 }
 
-impl std::error::Error for ParseSidError {}
+impl std::error::Error for SidParseError {}
 
-impl Display for ParseSidError {
+impl Display for SidParseError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self.kind {
-            ParseSidErrorKind::Invalid => write!(f, "invalid SID string"),
-            ParseSidErrorKind::InteriorNul => {
+            SidParseErrorKind::Invalid => write!(f, "invalid SID string"),
+            SidParseErrorKind::InteriorNul => {
                 write!(f, "SID string contains an interior NUL byte")
             }
-            ParseSidErrorKind::Windows(code) => {
+            SidParseErrorKind::Windows(code) => {
                 write!(
                     f,
                     "invalid SID string: {}",
@@ -743,60 +755,94 @@ impl Display for ParseSidError {
     }
 }
 
-impl From<ParseSidError> for Error {
-    fn from(_: ParseSidError) -> Error {
+impl From<SidParseError> for Error {
+    fn from(_: SidParseError) -> Error {
         Error::InvalidSid
     }
 }
 
+/// Parses a numeric SID string such as `S-1-5-32-544`.
+///
+/// The format is `S-1-<authority>` followed by zero to fifteen `-<sub-authority>`
+/// components: the literal `S` (case-insensitive), the revision `1`, an
+/// identifier authority of at most 48 bits in decimal or `0x`/`0X`-prefixed
+/// hexadecimal, and decimal sub-authorities. Parsing is pure Rust and never
+/// calls Windows; use [`SidBuf::from_string_sid`] for Windows-defined
+/// aliases such as `BA`.
+///
+/// Every string produced by the [`Display`] implementation parses back to an
+/// equal SID. The parser also accepts equivalent spellings that [`Display`]
+/// never produces: a lowercase `s`, leading zeros, and hexadecimal
+/// authorities small enough to be displayed in decimal. Signs, whitespace,
+/// empty components, and non-ASCII digits are rejected.
+///
+/// # Examples
+///
+/// ```
+/// use safe_sid::SidBuf;
+///
+/// let sid: SidBuf = "S-1-5-32-544".parse()?;
+/// assert_eq!(sid.authority(), 5);
+/// assert_eq!(sid.sub_authorities(), [32, 544]);
+///
+/// assert!("S-1-5-".parse::<SidBuf>().is_err());
+/// assert!("BA".parse::<SidBuf>().is_err()); // aliases need from_string_sid
+/// # Ok::<(), safe_sid::SidParseError>(())
+/// ```
 impl FromStr for SidBuf {
-    type Err = ParseSidError;
+    type Err = SidParseError;
 
+    /// Parses a numeric SID string.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SidParseError`] if the string does not match the format
+    /// described [above](#impl-FromStr-for-SidBuf).
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
         let mut parts = s.split('-');
 
         // Leading "S", case-insensitive
         match parts.next() {
             Some(p) if p.eq_ignore_ascii_case("S") => {}
-            _ => return Err(ParseSidError::invalid()),
+            _ => return Err(SidParseError::invalid()),
         }
 
         // Revision (only 1 is allowed)
         if parts.next() != Some("1") {
-            return Err(ParseSidError::invalid());
+            return Err(SidParseError::invalid());
         }
 
         // Identifier authority: decimal or 0x-prefixed hex, 48 bits max
-        let authority_str = parts.next().ok_or_else(ParseSidError::invalid)?;
+        let authority_str = parts.next().ok_or_else(SidParseError::invalid)?;
         let authority = match authority_str
             .strip_prefix("0x")
             .or_else(|| authority_str.strip_prefix("0X"))
         {
             Some(hex) if !hex.is_empty() && hex.bytes().all(|b| b.is_ascii_hexdigit()) => {
-                u64::from_str_radix(hex, 16).map_err(|_| ParseSidError::invalid())?
+                u64::from_str_radix(hex, 16).map_err(|_| SidParseError::invalid())?
             }
-            Some(_) => return Err(ParseSidError::invalid()),
+            Some(_) => return Err(SidParseError::invalid()),
             None if !authority_str.is_empty()
                 && authority_str.bytes().all(|b| b.is_ascii_digit()) =>
             {
                 authority_str
                     .parse::<u64>()
-                    .map_err(|_| ParseSidError::invalid())?
+                    .map_err(|_| SidParseError::invalid())?
             }
-            None => return Err(ParseSidError::invalid()),
+            None => return Err(SidParseError::invalid()),
         };
         // Remaining fields are decimal sub-authorities
         let sub_authorities = parts
             .map(|p| {
                 if p.is_empty() || !p.bytes().all(|b| b.is_ascii_digit()) {
-                    return Err(ParseSidError::invalid());
+                    return Err(SidParseError::invalid());
                 }
-                p.parse::<u32>().map_err(|_| ParseSidError::invalid())
+                p.parse::<u32>().map_err(|_| SidParseError::invalid())
             })
             .collect::<std::result::Result<Vec<u32>, _>>()?;
 
         // new() rejects authorities over 48 bits and more than 15 sub-authorities
-        SidBuf::new(authority, &sub_authorities).map_err(|_| ParseSidError::invalid())
+        SidBuf::new(authority, &sub_authorities).map_err(|_| SidParseError::invalid())
     }
 }
 
@@ -919,6 +965,7 @@ impl SidBuf {
     ///
     /// Extra capacity is not exposed by [`Sid::as_bytes`]; the logical length is
     /// determined by [`Sid::sub_authority_count`].
+    #[must_use]
     pub fn with_capacity(len: usize) -> SidBuf {
         let word_len = len.div_ceil(size_of::<u32>()).max(SID_HEADER_WORDS + 1);
 
@@ -993,6 +1040,7 @@ impl SidBuf {
     ///
     /// # let _ = lookup_account_name;
     /// ```
+    #[must_use]
     pub unsafe fn as_mut_ptr(&mut self) -> *mut c_void {
         let sid: &mut Sid = &mut self.sid;
         sid as *mut Sid as *mut c_void
@@ -1069,7 +1117,7 @@ impl SidBuf {
     ///
     /// # Errors
     ///
-    /// Returns [`ParseSidError`] if `s` contains an interior NUL byte or is
+    /// Returns [`SidParseError`] if `s` contains an interior NUL byte or is
     /// rejected by `ConvertStringSidToSidA`.
     ///
     /// # Examples
@@ -1079,21 +1127,21 @@ impl SidBuf {
     ///
     /// let administrators = SidBuf::from_string_sid("BA")?;
     /// assert_eq!(administrators.to_string(), "S-1-5-32-544");
-    /// # Ok::<(), safe_sid::ParseSidError>(())
+    /// # Ok::<(), safe_sid::SidParseError>(())
     /// ```
-    pub fn from_string_sid(s: &str) -> std::result::Result<SidBuf, ParseSidError> {
-        let s = std::ffi::CString::new(s).map_err(|_| ParseSidError {
-            kind: ParseSidErrorKind::InteriorNul,
+    pub fn from_string_sid(s: &str) -> std::result::Result<SidBuf, SidParseError> {
+        let s = std::ffi::CString::new(s).map_err(|_| SidParseError {
+            kind: SidParseErrorKind::InteriorNul,
         })?;
 
         unsafe {
             let mut sid = std::ptr::null_mut();
             if bindings::ConvertStringSidToSidA(s.as_ptr().cast(), &mut sid) == 0 {
-                return Err(ParseSidError {
-                    kind: ParseSidErrorKind::Windows(bindings::GetLastError()),
+                return Err(SidParseError {
+                    kind: SidParseErrorKind::Windows(bindings::GetLastError()),
                 });
             }
-            let res = SidBuf::from_psid(sid).map_err(|_| ParseSidError::invalid());
+            let res = SidBuf::from_psid(sid).map_err(|_| SidParseError::invalid());
             bindings::LocalFree(sid);
             res
         }
@@ -1124,7 +1172,7 @@ impl SidBuf {
     /// # Ok::<(), safe_sid::Error>(())
     /// ```
     pub unsafe fn from_psid(psid: impl AsSidPtr) -> Result<Self> {
-        // SAFETY: safety requirements noted to called in the doc comment
+        // SAFETY: safety requirements noted to the caller in the doc comment
         let src = unsafe { Sid::from_psid(psid) }?;
         Ok(src.to_owned())
     }
@@ -1374,7 +1422,7 @@ mod tests {
         let io_error: std::io::Error = Error::Windows(5).into();
         assert_eq!(io_error.raw_os_error(), Some(5));
 
-        assert_eq!(Error::from(ParseSidError::invalid()), Error::InvalidSid);
+        assert_eq!(Error::from(SidParseError::invalid()), Error::InvalidSid);
 
         for error in [Error::TooManySubAuthorities, Error::Windows(5)] {
             assert!(!error.to_string().is_empty());
@@ -1641,12 +1689,12 @@ mod tests {
     fn from_string_sid_fails_on_bad_input() {
         assert!(matches!(
             SidBuf::from_string_sid("").unwrap_err().kind,
-            ParseSidErrorKind::Windows(_)
+            SidParseErrorKind::Windows(_)
         ));
         assert!(SidBuf::from_string_sid("not-a-sid").is_err());
         assert!(matches!(
             SidBuf::from_string_sid("BA\0").unwrap_err().kind,
-            ParseSidErrorKind::InteriorNul
+            SidParseErrorKind::InteriorNul
         ));
     }
 }
