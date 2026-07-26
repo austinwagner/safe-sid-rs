@@ -30,6 +30,7 @@ jobs:
 
   semver:
     name: Check semver
+    if: github.event_name == 'pull_request' && github.base_ref == 'main' && startsWith(github.head_ref, 'release/')
     runs-on: windows-latest
 
     steps:
