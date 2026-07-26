@@ -14,13 +14,16 @@
 //!
 //! # Creating SIDs
 //!
-//! Build a SID from its six-byte identifier authority and its sub-authorities:
+//! Build a SID from its identifier authority and its sub-authorities. The
+//! authority can be one of the constants in [`authority`], its raw six-byte
+//! form, or a plain integer:
 //!
 //! ```
 //! use safe_sid::SidBuf;
+//! use safe_sid::authority::SECURITY_NT_AUTHORITY;
 //!
 //! // S-1-5-32-544 is the BUILTIN\Administrators SID.
-//! let administrators = SidBuf::new([0, 0, 0, 0, 0, 5], &[32, 544])?;
+//! let administrators = SidBuf::new(SECURITY_NT_AUTHORITY, &[32, 544])?;
 //! assert_eq!(administrators.to_string(), "S-1-5-32-544");
 //! # Ok::<(), safe_sid::Error>(())
 //! ```
@@ -28,7 +31,8 @@
 //! Or ask Windows to create a [well-known SID](well_known):
 //!
 //! ```
-//! use safe_sid::{SidBuf, WinLocalSystemSid};
+//! use safe_sid::SidBuf;
+//! use safe_sid::well_known::WinLocalSystemSid;
 //!
 //! let local_system = SidBuf::well_known(WinLocalSystemSid, None)?;
 //! assert_eq!(local_system.to_string(), "S-1-5-18");
@@ -105,13 +109,17 @@ mod bindings;
 /// `WELL_KNOWN_SID_TYPE` enumeration.
 pub mod well_known;
 
-#[doc(no_inline)]
-pub use well_known::*;
+/// Constants for the identifier authorities defined by Windows, for use with
+/// [`SidBuf::new`].
+///
+/// The names and values correspond to Windows'
+/// `SECURITY_*_AUTHORITY` constants.
+pub mod authority;
 
 /// A Windows well-known SID type.
 ///
 /// Values of this type are exposed as the named constants in [`well_known`],
-/// such as [`WinLocalSystemSid`]. The integer accepted by the underlying
+/// such as [`well_known::WinLocalSystemSid`]. The integer accepted by the underlying
 /// Windows APIs is intentionally not part of this crate's public API.
 ///
 /// Raw integers cannot be passed where a well-known SID type is expected:
@@ -137,6 +145,7 @@ const SID_REVISION: u8 = 1;
 const SID_MAX_SUB_AUTHORITIES: u8 = 15;
 const SID_HEADER_WORDS: usize = 2;
 const ERROR_INVALID_SID: u32 = 0x0539;
+const MAX_AUTHORITY: u64 = 0xFFFF_FFFF_FFFF;
 
 /// An error reported while creating, validating, or querying a SID.
 ///
@@ -195,7 +204,8 @@ pub trait AsSidPtr {
 
 /// Converts a well-known SID type to the value expected by Windows.
 ///
-/// The crate's constants, such as [`WinLocalSystemSid`], implement this trait.
+/// The crate's constants, such as [`well_known::WinLocalSystemSid`], implement
+/// this trait.
 pub trait AsWellKnownSidType {
     /// Returns the wrapped well-known SID type.
     fn as_well_known_sid_type(&self) -> WellKnownSidType;
@@ -218,6 +228,72 @@ impl AsSidPtr for *mut c_void {
         *self
     }
 }
+
+mod sealed {
+    /// Prevents implementations of [`IntoAuthority`](super::IntoAuthority)
+    /// outside of this crate.
+    pub trait Sealed {}
+}
+
+/// Converts a value into a SID's six-byte identifier authority.
+///
+/// This trait is implemented for `[u8; 6]`, the authority's raw big-endian
+/// form used by the constants in [`authority`], and for every primitive
+/// integer type. Integer values must fit in 48 bits.
+///
+/// The trait is sealed and cannot be implemented outside of `safe-sid`:
+///
+/// ```compile_fail
+/// struct CustomAuthority;
+///
+/// impl safe_sid::IntoAuthority for CustomAuthority {
+///     fn try_into_authority(self) -> safe_sid::Result<[u8; 6]> {
+///         Ok([0; 6])
+///     }
+/// }
+/// ```
+pub trait IntoAuthority: sealed::Sealed {
+    /// Returns the value as a big-endian six-byte identifier authority.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ERROR_INVALID_SID` if the value cannot be represented in
+    /// 48 bits.
+    fn try_into_authority(self) -> Result<[u8; 6]>;
+}
+
+impl sealed::Sealed for [u8; 6] {}
+
+impl IntoAuthority for [u8; 6] {
+    fn try_into_authority(self) -> Result<[u8; 6]> {
+        Ok(self)
+    }
+}
+
+macro_rules! impl_into_authority {
+    ($($t:ty)*) => {$(
+        impl sealed::Sealed for $t {}
+
+        impl IntoAuthority for $t {
+            #[allow(clippy::useless_conversion)] // the u64 expansion converts u64 to u64
+            fn try_into_authority(self) -> Result<[u8; 6]> {
+                match u64::try_from(self) {
+                    Ok(value) if value <= MAX_AUTHORITY => {
+                        Ok(value.to_be_bytes()[2..].try_into().unwrap())
+                    }
+                    _ => Err(invalid_sid_err()),
+                }
+            }
+        }
+    )*};
+}
+
+// i32 is required in this list: with multiple integer impls, an unsuffixed
+// literal in `SidBuf::new(5, ...)` resolves through the compiler's i32
+// fallback, so removing i32 breaks such calls. The list deliberately covers
+// every primitive integer type so it never needs to grow, which keeps that
+// fallback (and therefore inference) stable.
+impl_into_authority!(u8 u16 u32 u64 u128 usize i8 i16 i32 i64 i128 isize);
 
 /// A borrowed SID.
 ///
@@ -374,6 +450,15 @@ impl Sid {
     pub fn authority(&self) -> u64 {
         let [a0, a1, a2, a3, a4, a5] = self.identifier_authority;
         u64::from_be_bytes([0, 0, a0, a1, a2, a3, a4, a5])
+    }
+
+    /// Returns the identifier authority in its big-endian six-byte form.
+    ///
+    /// This is the representation used by the constants in [`authority`] and
+    /// accepted by [`SidBuf::new`].
+    #[inline]
+    pub fn authority_bytes(&self) -> [u8; 6] {
+        self.identifier_authority
     }
 
     /// Returns the sub-authority at `idx`, or `None` if it is out of bounds.
@@ -608,18 +693,14 @@ impl FromStr for SidBuf {
             Some(hex) => u64::from_str_radix(hex, 16).map_err(|_| ParseError)?,
             None => authority_str.parse::<u64>().map_err(|_| ParseError)?,
         };
-        if authority > 0xFFFF_FFFF_FFFF {
-            return Err(ParseError);
-        }
-        let identifier_authority: [u8; 6] = authority.to_be_bytes()[2..].try_into().unwrap();
-
         // Remaining fields are decimal sub-authorities
         let sub_authorities = parts
             .map(|p| p.parse::<u32>())
             .collect::<std::result::Result<Vec<u32>, _>>()
             .map_err(|_| ParseError)?;
 
-        SidBuf::new(identifier_authority, &sub_authorities).map_err(|_| ParseError)
+        // new() rejects authorities over 48 bits and more than 15 sub-authorities
+        SidBuf::new(authority, &sub_authorities).map_err(|_| ParseError)
     }
 }
 
@@ -646,18 +727,30 @@ impl SidBuf {
 
     /// Builds a SID from its identifier authority and sub-authorities.
     ///
-    /// Returns `ERROR_INVALID_SID` if more than 15 sub-authorities are given.
+    /// The authority may be one of the constants in [`authority`], the raw
+    /// big-endian `[u8; 6]` form, or any primitive integer that fits in
+    /// 48 bits.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ERROR_INVALID_SID` if more than 15 sub-authorities are given
+    /// or the authority cannot be represented in 48 bits.
     ///
     /// # Examples
     ///
     /// ```
     /// use safe_sid::SidBuf;
+    /// use safe_sid::authority::SECURITY_NT_AUTHORITY;
     ///
-    /// let administrators = SidBuf::new([0, 0, 0, 0, 0, 5], &[32, 544])?;
+    /// let administrators = SidBuf::new(SECURITY_NT_AUTHORITY, &[32, 544])?;
     /// assert_eq!(administrators.to_string(), "S-1-5-32-544");
+    ///
+    /// // The same SID built from the authority's integer value.
+    /// assert_eq!(SidBuf::new(5, &[32, 544])?, administrators);
     /// # Ok::<(), safe_sid::Error>(())
     /// ```
-    pub fn new(identifier_authority: [u8; 6], sub_authorities: &[u32]) -> Result<Self> {
+    pub fn new(identifier_authority: impl IntoAuthority, sub_authorities: &[u32]) -> Result<Self> {
+        let identifier_authority = identifier_authority.try_into_authority()?;
         let count = sub_authorities.len();
         if count > SID_MAX_SUB_AUTHORITIES as usize {
             return Err(invalid_sid_err());
@@ -772,7 +865,8 @@ impl SidBuf {
     /// # Examples
     ///
     /// ```
-    /// use safe_sid::{SidBuf, WinLocalSystemSid};
+    /// use safe_sid::SidBuf;
+    /// use safe_sid::well_known::WinLocalSystemSid;
     ///
     /// let local_system = SidBuf::well_known(WinLocalSystemSid, None)?;
     /// assert_eq!(local_system.to_string(), "S-1-5-18");
@@ -943,7 +1037,7 @@ impl Debug for SidBuf {
 
 impl Default for SidBuf {
     fn default() -> Self {
-        SidBuf::new([0, 0, 0, 0, 0, 0], &[0]).unwrap()
+        SidBuf::new(authority::SECURITY_NULL_SID_AUTHORITY, &[0]).unwrap()
     }
 }
 
@@ -963,12 +1057,12 @@ impl PartialEq<Sid> for SidBuf {
 
 #[cfg(test)]
 mod tests {
+    use super::authority::*;
+    use super::well_known::*;
     use super::*;
 
-    const NT_AUTHORITY: [u8; 6] = [0, 0, 0, 0, 0, 5];
-
     fn nt_sid(sub_authorities: &[u32]) -> SidBuf {
-        SidBuf::new(NT_AUTHORITY, sub_authorities).unwrap()
+        SidBuf::new(SECURITY_NT_AUTHORITY, sub_authorities).unwrap()
     }
 
     #[test]
@@ -991,6 +1085,66 @@ mod tests {
         assert_eq!(
             SidBuf::new([0; 6], &[0; 16]).unwrap_err().code(),
             ERROR_INVALID_SID
+        );
+    }
+
+    #[test]
+    fn new_accepts_every_authority_form() {
+        let from_const = SidBuf::new(SECURITY_NT_AUTHORITY, &[18]).unwrap();
+        // Each of these forms must keep compiling: the unsuffixed literal
+        // resolves through the i32 fallback and the unsuffixed array through
+        // the sole [u8; 6] impl
+        let from_array = SidBuf::new([0, 0, 0, 0, 0, 5], &[18]).unwrap();
+        let from_literal = SidBuf::new(5, &[18]).unwrap();
+        let from_u8 = SidBuf::new(5u8, &[18]).unwrap();
+        let from_u64 = SidBuf::new(5u64, &[18]).unwrap();
+        let from_usize = SidBuf::new(5usize, &[18]).unwrap();
+        let from_i128 = SidBuf::new(5i128, &[18]).unwrap();
+
+        for sid in [
+            from_array,
+            from_literal,
+            from_u8,
+            from_u64,
+            from_usize,
+            from_i128,
+        ] {
+            assert_eq!(sid, from_const);
+        }
+    }
+
+    #[test]
+    fn new_enforces_the_authority_range() {
+        assert_eq!(
+            SidBuf::new(MAX_AUTHORITY, &[]).unwrap().authority(),
+            MAX_AUTHORITY
+        );
+
+        for result in [
+            SidBuf::new(-1, &[]),
+            SidBuf::new(1u64 << 48, &[]),
+            SidBuf::new(u128::MAX, &[]),
+            SidBuf::new(i64::MIN, &[]),
+        ] {
+            assert_eq!(result.unwrap_err().code(), ERROR_INVALID_SID);
+        }
+    }
+
+    #[test]
+    fn authority_getters_round_trip_through_new() {
+        let sid = nt_sid(&[32, 544]);
+        assert_eq!(sid.authority(), 5);
+        assert_eq!(sid.authority_bytes(), SECURITY_NT_AUTHORITY);
+        assert_eq!(
+            SidBuf::new(sid.authority(), sid.sub_authorities()).unwrap(),
+            sid
+        );
+
+        let large = SidBuf::new(1u64 << 32, &[1]).unwrap();
+        assert_eq!(large.authority_bytes(), [0, 1, 0, 0, 0, 0]);
+        assert_eq!(
+            SidBuf::new(large.authority_bytes(), large.sub_authorities()).unwrap(),
+            large
         );
     }
 
@@ -1201,7 +1355,7 @@ mod tests {
         assert!(!first.equal_prefix(&different_count));
         assert!(!first.equal_prefix(&different_authority));
 
-        let no_sub_authorities = SidBuf::new(NT_AUTHORITY, &[]).unwrap();
+        let no_sub_authorities = SidBuf::new(SECURITY_NT_AUTHORITY, &[]).unwrap();
         assert!(no_sub_authorities.equal_prefix(&no_sub_authorities));
     }
 

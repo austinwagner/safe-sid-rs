@@ -20,20 +20,31 @@ same `windows` version.
 
 ### Build a SID by hand
 
+The identifier authority can be one of the constants in the `authority`
+module, a plain integer that fits in 48 bits, or the raw six-byte form.
+
 ```rust
-let admins = SidBuf::new([0, 0, 0, 0, 0, 5], &[32, 544]).unwrap();
+use safe_sid::authority::SECURITY_NT_AUTHORITY;
+
+let admins = SidBuf::new(SECURITY_NT_AUTHORITY, &[32, 544]).unwrap();
 assert_eq!(admins.to_string(), "S-1-5-32-544");
+
+let same = SidBuf::new(5, &[32, 544]).unwrap();
+assert_eq!(same, admins);
 ```
 
 ### Build a well-known SID
 
 ```rust
+use safe_sid::well_known::WinLocalSystemSid;
+
 let local_system = SidBuf::well_known(WinLocalSystemSid, None).unwrap();
 assert_eq!(local_system.to_string(), "S-1-5-18");
 ```
 
-The `Win*Sid` constants use the opaque `WellKnownSidType` wrapper, so arbitrary
-integer values cannot be passed to the well-known SID APIs.
+The `Win*Sid` constants in the `well_known` module use the opaque
+`WellKnownSidType` wrapper, so arbitrary integer values cannot be passed to the
+well-known SID APIs.
 
 ### Pass a SID to a Windows API
 
