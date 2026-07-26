@@ -32,6 +32,9 @@ let local_system = SidBuf::well_known(WinLocalSystemSid, None).unwrap();
 assert_eq!(local_system.to_string(), "S-1-5-18");
 ```
 
+The `Win*Sid` constants use the opaque `WellKnownSidType` wrapper, so arbitrary
+integer values cannot be passed to the well-known SID APIs.
+
 ### Pass a SID to a Windows API
 
 ```rust
@@ -80,6 +83,16 @@ fn lookup_account_name(name: &CStr) -> Result<SidBuf> {
 }
 ```
 
+
+## Development
+
+Repository maintenance commands are exposed through `cargo xtask`. Run
+`cargo xtask --help` to list them. To refresh the vendored Windows bindings and
+well-known SID constants:
+
+```text
+cargo xtask regenerate-bindings
+```
 
 ## License
 

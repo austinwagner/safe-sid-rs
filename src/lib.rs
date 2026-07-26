@@ -94,35 +94,44 @@ use std::hash::{Hash, Hasher};
 use std::ops::Deref;
 use std::str::FromStr;
 
-#[allow(
-    non_snake_case,
-    non_upper_case_globals,
-    non_camel_case_types,
-    dead_code,
-    clippy::all
-)]
-mod bindings {
-    include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
-}
+#[allow(non_snake_case, non_camel_case_types, dead_code, clippy::all)]
+mod bindings;
 
-#[allow(
-    non_snake_case,
-    non_upper_case_globals,
-    non_camel_case_types,
-    dead_code,
-    clippy::all
-)]
+#[allow(non_upper_case_globals)]
 /// Constants for the SID types accepted by [`SidBuf::well_known`] and
 /// [`Sid::is_well_known`].
 ///
 /// The names and values correspond to Windows'
 /// `WELL_KNOWN_SID_TYPE` enumeration.
-pub mod well_known {
-    include!(concat!(env!("OUT_DIR"), "/well_known.rs"));
-}
+pub mod well_known;
 
 #[doc(no_inline)]
 pub use well_known::*;
+
+/// A Windows well-known SID type.
+///
+/// Values of this type are exposed as the named constants in [`well_known`],
+/// such as [`WinLocalSystemSid`]. The integer accepted by the underlying
+/// Windows APIs is intentionally not part of this crate's public API.
+///
+/// Raw integers cannot be passed where a well-known SID type is expected:
+///
+/// ```compile_fail
+/// use safe_sid::SidBuf;
+///
+/// let _ = SidBuf::well_known(22, None);
+/// ```
+///
+/// The wrapper cannot be constructed directly:
+///
+/// ```compile_fail
+/// use safe_sid::WellKnownSidType;
+///
+/// let _ = WellKnownSidType(22);
+/// ```
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[repr(transparent)]
+pub struct WellKnownSidType(i32);
 
 const SID_REVISION: u8 = 1;
 const SID_MAX_SUB_AUTHORITIES: u8 = 15;
@@ -188,12 +197,12 @@ pub trait AsSidPtr {
 ///
 /// The crate's constants, such as [`WinLocalSystemSid`], implement this trait.
 pub trait AsWellKnownSidType {
-    /// Returns the numeric `WELL_KNOWN_SID_TYPE` value.
-    fn as_well_known_sid_type(&self) -> WELL_KNOWN_SID_TYPE;
+    /// Returns the wrapped well-known SID type.
+    fn as_well_known_sid_type(&self) -> WellKnownSidType;
 }
 
-impl AsWellKnownSidType for WELL_KNOWN_SID_TYPE {
-    fn as_well_known_sid_type(&self) -> WELL_KNOWN_SID_TYPE {
+impl AsWellKnownSidType for WellKnownSidType {
+    fn as_well_known_sid_type(&self) -> WellKnownSidType {
         *self
     }
 }
@@ -465,13 +474,9 @@ impl Sid {
     /// Calls the Windows `IsWellKnownSid` function.
     #[inline]
     pub fn is_well_known(&self, well_known_type: impl AsWellKnownSidType) -> bool {
+        let well_known_type = well_known_type.as_well_known_sid_type();
         // SAFETY: self supplies a valid SID pointer
-        unsafe {
-            bindings::IsWellKnownSid(
-                self.as_ptr().cast_mut(),
-                well_known_type.as_well_known_sid_type(),
-            ) != 0
-        }
+        unsafe { bindings::IsWellKnownSid(self.as_ptr().cast_mut(), well_known_type.0) != 0 }
     }
 }
 
@@ -784,7 +789,7 @@ impl SidBuf {
                 .unwrap_or(std::ptr::null_mut());
             let mut len = 0u32;
             if bindings::CreateWellKnownSid(
-                well_known_type,
+                well_known_type.0,
                 domain_psid,
                 std::ptr::null_mut(),
                 &mut len,
@@ -799,7 +804,7 @@ impl SidBuf {
             let word_len = (len as usize).div_ceil(size_of::<u32>());
             let mut words: Box<[u32]> = vec![0u32; word_len].into_boxed_slice();
             if bindings::CreateWellKnownSid(
-                well_known_type,
+                well_known_type.0,
                 domain_psid,
                 words.as_mut_ptr().cast(),
                 &mut len,

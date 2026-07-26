@@ -8,6 +8,12 @@ license = "ISC"
 keywords = ["windows", "security", "SID"]
 categories = ["api-bindings", "os::windows-apis"]
 repository = "https://github.com/austinwagner/safe-sid-rs"
+exclude = [".cargo", "xtask"]
+
+[workspace]
+members = ["xtask"]
+default-members = ["."]
+resolver = "3"
 
 [package.metadata.docs.rs]
 all-features = true
@@ -22,6 +28,3 @@ windows-link = "0.2"
 windows = { version = "0.62", default-features = false, features = [
     "Win32_Security",
 ] }
-
-[build-dependencies]
-windows-bindgen = "0.63"
